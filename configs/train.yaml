@@ -1,0 +1,80 @@
+paths:
+  # Complete local Diffusers snapshot. Training never downloads missing files.
+  pretrained_model: /mnt/afs_fangwenqi/models/FLUX.1-Kontext-dev
+  dataset_root: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene
+  train_manifest: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene/manifests/train.jsonl
+  validation_manifest: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene/manifests/validation.jsonl
+  test_manifest: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene/manifests/test.jsonl
+  output_root: /mnt/afs_fangwenqi/new_method/outputs
+  resume_checkpoint: null
+
+data:
+  resolution: 512
+  exposure: 1.0
+  num_workers: 4
+  seed: 20260827
+  samples_per_scene:
+    train: 64
+    validation: 8
+    test: 8
+  tasks: [ambient_scale, global_diffuse, add_light, in_scene_light]
+  task_probabilities:
+    ambient_scale: 0.25
+    global_diffuse: 0.25
+    add_light: 0.25
+    in_scene_light: 0.25
+  ranges:
+    ambient_scale: [0.0, 1.5]
+    light_color: [0.2, 1.0]
+    light_intensity: [0.1, 1.5]
+    fixture_intensity: [0.0, 1.5]
+    fixture_transition: [0.0, 1.0]
+
+model:
+  max_lights: 3
+
+lighting:
+  hidden_dim: 512
+  fourier_features: 32
+  fourier_sigma: 5.0
+  fourier_seed: 0
+
+lora:
+  rank: 16
+  alpha: 16
+  dropout: 0.0
+  target_modules:
+    - attn.to_k
+    - attn.to_q
+    - attn.to_v
+    - attn.to_out.0
+    - attn.add_k_proj
+    - attn.add_q_proj
+    - attn.add_v_proj
+    - attn.to_add_out
+    - ff.net.0.proj
+    - ff.net.2
+    - ff_context.net.0.proj
+    - ff_context.net.2
+    - proj_mlp
+
+train:
+  mixed_precision: bf16
+  micro_batch_size: 1
+  gradient_accumulation_steps: 4
+  max_steps: 15000
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  max_grad_norm: 1.0
+  checkpointing_steps: 500
+  checkpoints_total_limit: 5
+  gradient_checkpointing: true
+  guidance_scale: 3.5
+  vae_encode_mode: mode
+  seed: 42
+  run_name: flux_kontext_tokenlight_lora_no_text
+
+infer:
+  steps: 28
+  guidance_scale: 2.5
+  seed: 42

@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenlight-flux-kontext"
+version = "0.1.0"
+description = "FLUX.1-Kontext-dev LoRA plus numeric lighting-token conditioning"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["src"]
