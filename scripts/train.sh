@@ -23,6 +23,10 @@ export OPENCV_IO_ENABLE_OPENEXR=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+# RTX 6000D systems without GPU P2P can fail in NCCL's shareable cuMem-host
+# path. This keeps the safer shared-memory fallback and remains overridable.
+export NCCL_CUMEM_HOST_ENABLE="${NCCL_CUMEM_HOST_ENABLE:-0}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 
 cd "${PROJECT_ROOT}"
 EXPECTED_GPUS="${NUM_PROCESSES}" python - <<'PY'
@@ -47,4 +51,3 @@ exec accelerate launch \
   --main_process_port "${MASTER_PORT}" \
   --mixed_precision bf16 \
   train.py --config "${CONFIG_FILE}" "$@"
-

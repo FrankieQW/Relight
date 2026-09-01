@@ -217,7 +217,15 @@ CUDA_DEVICES=0 NUM_PROCESSES=1 \
   bash scripts/train.sh --max-steps 4 --resume latest
 ```
 
-## 9. 八卡训练
+## 9. 多卡训练
+
+训练包装器采用 `trainable_parameters_only` DDP：每个 rank 从同一个本地 checkpoint 独立加载
+冻结 FLUX 主干，DDP 只注册并同步 LoRA 和 LightingTokenEncoder。这样不会在初始化时广播
+数百 MiB 的冻结权重。启动日志应包含：
+
+```json
+{"ddp_mode":"trainable_parameters_only","ddp_parameter_count":...}
+```
 
 ```bash
 cd /mnt/afs_fangwenqi/new_method
@@ -231,11 +239,21 @@ CUDA_DEVICES=0,1,2,3,4,5,6,7 NUM_PROCESSES=8 MASTER_PORT=29631 \
   bash scripts/train.sh
 ```
 
+对于无 GPU P2P 的双 RTX 6000D，启动脚本默认设置
+`NCCL_CUMEM_HOST_ENABLE=0` 和 `NCCL_IB_DISABLE=1`。手动执行 `accelerate launch` 时应先设置：
+
+```bash
+export NCCL_CUMEM_HOST_ENABLE=0
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1
+```
+
 输出默认位于：
 
 ```text
-/mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora/
+/mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora_no_text/
 ├── config.yaml
+├── tensorboard/
 ├── checkpoint-500/
 ├── checkpoint-1000/
 └── final/
@@ -244,13 +262,35 @@ CUDA_DEVICES=0,1,2,3,4,5,6,7 NUM_PROCESSES=8 MASTER_PORT=29631 \
 恢复使用 `--resume latest`，或指定完整 `checkpoint-N` 目录。恢复时会严格检查 lighting
 schema、Fourier 设置、context dimension 和权重 shape。
 
+训练终端只在 local main process 显示一个 tqdm 进度条，包含 loss、学习率、梯度范数、当前
+任务和单卡峰值显存。TensorBoard 每个 optimizer step 记录：
+
+```text
+train/loss
+train/learning_rate
+train/grad_norm
+train/timestep_mean
+train/sigma_mean
+system/max_memory_allocated_gib
+system/max_memory_reserved_gib
+```
+
+另开终端启动 TensorBoard：
+
+```bash
+tensorboard \
+  --logdir /mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora_no_text/tensorboard \
+  --host 0.0.0.0 \
+  --port 6006
+```
+
 ## 10. 推理
 
 ### Ambient scale
 
 ```bash
 bash scripts/infer.sh \
-  --lora /mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora/final \
+  --lora /mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora_no_text/final \
   --source /path/to/component/ambient.exr \
   --output /mnt/afs_fangwenqi/tokenlighttest/ambient_05.png \
   --task ambient_scale \

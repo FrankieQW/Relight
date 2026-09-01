@@ -164,12 +164,31 @@ class LightingTokenEncoder(nn.Module):
 
 
 class LightingConditionedTransformer(nn.Module):
-    """Append lighting tokens to FLUX text/context tokens before joint attention."""
+    """Use lighting tokens as FLUX context before joint attention."""
 
-    def __init__(self, transformer: nn.Module, lighting_encoder: LightingTokenEncoder):
+    def __init__(
+        self,
+        transformer: nn.Module,
+        lighting_encoder: LightingTokenEncoder,
+        *,
+        ddp_trainable_only: bool = False,
+    ):
         super().__init__()
-        self.transformer = transformer
+        if ddp_trainable_only:
+            # The frozen FLUX backbone is loaded independently from the same checkpoint
+            # on every rank. Keep it outside this wrapper's registered module tree so
+            # DDP does not broadcast billions of frozen parameters during initialization.
+            object.__setattr__(self, "transformer", transformer)
+            trainable_transformer_parameters = [
+                parameter for parameter in transformer.parameters() if parameter.requires_grad
+            ]
+            if not trainable_transformer_parameters:
+                raise RuntimeError("the FLUX transformer has no trainable adapter parameters")
+            self.ddp_transformer_parameters = nn.ParameterList(trainable_transformer_parameters)
+        else:
+            self.transformer = transformer
         self.lighting_encoder = lighting_encoder
+        self.ddp_trainable_only = bool(ddp_trainable_only)
 
     @property
     def config(self):

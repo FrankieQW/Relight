@@ -226,19 +226,33 @@ def main() -> None:
     model_path = validate_model_snapshot(config["paths"]["pretrained_model"])
 
     from accelerate import Accelerator
-    from accelerate.utils import set_seed
+    from accelerate.utils import (
+        DistributedDataParallelKwargs,
+        ProjectConfiguration,
+        set_seed,
+    )
     from diffusers import FlowMatchEulerDiscreteScheduler, FluxKontextPipeline
     from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
+    from tqdm.auto import tqdm
 
     train_config = config["train"]
     mixed_precision = str(train_config["mixed_precision"])
     output_root = Path(config["paths"]["output_root"]).expanduser()
     run_dir = output_root / str(train_config["run_name"])
+    project_config = ProjectConfiguration(
+        project_dir=str(run_dir),
+        logging_dir=str(run_dir / "tensorboard"),
+    )
+    ddp_config = DistributedDataParallelKwargs(
+        broadcast_buffers=False,
+        gradient_as_bucket_view=True,
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=int(train_config["gradient_accumulation_steps"]),
         mixed_precision=None if mixed_precision == "no" else mixed_precision,
         log_with="tensorboard",
-        project_dir=str(run_dir),
+        project_config=project_config,
+        kwargs_handlers=[ddp_config],
     )
     set_seed(int(train_config["seed"]), device_specific=True)
     weight_dtype = dtype_for(mixed_precision)
@@ -278,7 +292,11 @@ def main() -> None:
         fourier_sigma=float(lighting_config["fourier_sigma"]),
         fourier_seed=int(lighting_config["fourier_seed"]),
     )
-    model = LightingConditionedTransformer(transformer, lighting_encoder)
+    model = LightingConditionedTransformer(
+        transformer,
+        lighting_encoder,
+        ddp_trainable_only=True,
+    )
     # Text is not a model condition in this method. Drop the pretrained text
     # components after pipeline construction so they are neither encoded nor moved to GPU.
     pipeline.text_encoder = None
@@ -295,6 +313,15 @@ def main() -> None:
         parameter.numel() for parameter in transformer.parameters() if parameter.requires_grad
     )
     lighting_parameter_count = sum(parameter.numel() for parameter in lighting_encoder.parameters())
+    ddp_parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    expected_ddp_parameter_count = lora_parameter_count + lighting_parameter_count
+    if ddp_parameter_count != expected_ddp_parameter_count:
+        raise RuntimeError(
+            "DDP parameter contract mismatch: "
+            f"registered={ddp_parameter_count}, expected={expected_ddp_parameter_count}"
+        )
+    if any(not parameter.requires_grad for parameter in model.parameters()):
+        raise RuntimeError("a frozen FLUX parameter was unexpectedly registered for DDP")
 
     optimizer = torch.optim.AdamW(
         trainable,
@@ -395,7 +422,28 @@ def main() -> None:
 
     accelerator.register_save_state_pre_hook(save_hook)
     accelerator.register_load_state_pre_hook(load_hook)
+    # The backbone is intentionally unregistered from the wrapper, so move it
+    # explicitly. Its LoRA parameters share identity with the registered
+    # ParameterList and move together with the backbone.
+    transformer.to(accelerator.device)
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+    if accelerator.is_main_process:
+        print(
+            json.dumps(
+                {
+                    "ddp_mode": "trainable_parameters_only",
+                    "ddp_parameter_count": ddp_parameter_count,
+                    "lora_parameter_count": lora_parameter_count,
+                    "lighting_encoder_parameter_count": lighting_parameter_count,
+                    "frozen_backbone_parameter_count": sum(
+                        parameter.numel()
+                        for parameter in transformer.parameters()
+                        if not parameter.requires_grad
+                    ),
+                }
+            ),
+            flush=True,
+        )
 
     # Preserve any per-module dtype choices made by Diffusers while moving the VAE.
     vae.to(accelerator.device).eval()
@@ -419,9 +467,19 @@ def main() -> None:
     vae_encode_mode = str(train_config.get("vae_encode_mode", "mode"))
     accelerator.init_trackers(str(train_config["run_name"]))
     model.train()
+    transformer.train()
+    progress_bar = tqdm(
+        total=max_steps,
+        initial=global_step,
+        disable=not accelerator.is_local_main_process,
+        desc="train",
+        dynamic_ncols=True,
+        unit="step",
+    )
 
     while global_step < max_steps:
         for batch in loader:
+            grad_norm: torch.Tensor | float | None = None
             with accelerator.accumulate(model):
                 with torch.no_grad():
                     target_latents = encode_vae(
@@ -514,16 +572,50 @@ def main() -> None:
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(trainable, max_grad_norm)
+                    grad_norm = accelerator.clip_grad_norm_(trainable, max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
             if accelerator.sync_gradients:
                 global_step += 1
-                mean_loss = accelerator.gather(loss.detach().repeat(hidden_states.shape[0])).mean().item()
-                accelerator.log({"train/loss": mean_loss}, step=global_step)
-                if accelerator.is_main_process and global_step % 10 == 0:
-                    print(f"step={global_step}/{max_steps} loss={mean_loss:.6f}", flush=True)
+                mean_loss = accelerator.gather(loss.detach().reshape(1)).mean().item()
+                mean_timestep = accelerator.gather(
+                    (timesteps.detach().float() / 1000.0).reshape(-1)
+                ).mean().item()
+                mean_sigma = accelerator.gather(sigmas.detach().float().reshape(-1)).mean().item()
+                current_lr = float(optimizer.param_groups[0]["lr"])
+                grad_norm_value = (
+                    float(grad_norm.detach().float().item())
+                    if isinstance(grad_norm, torch.Tensor)
+                    else float(grad_norm or 0.0)
+                )
+                metrics = {
+                    "train/loss": mean_loss,
+                    "train/learning_rate": current_lr,
+                    "train/grad_norm": grad_norm_value,
+                    "train/timestep_mean": mean_timestep,
+                    "train/sigma_mean": mean_sigma,
+                }
+                if accelerator.device.type == "cuda":
+                    metrics["system/max_memory_allocated_gib"] = (
+                        torch.cuda.max_memory_allocated(accelerator.device) / (1024**3)
+                    )
+                    metrics["system/max_memory_reserved_gib"] = (
+                        torch.cuda.max_memory_reserved(accelerator.device) / (1024**3)
+                    )
+                accelerator.log(metrics, step=global_step)
+                progress_bar.update(1)
+                progress_bar.set_postfix(
+                    loss=f"{mean_loss:.4f}",
+                    lr=f"{current_lr:.2e}",
+                    grad=f"{grad_norm_value:.3f}",
+                    task=batch["task_name"][0] if batch["task_name"] else "-",
+                    mem=(
+                        f"{metrics['system/max_memory_allocated_gib']:.1f}G"
+                        if "system/max_memory_allocated_gib" in metrics
+                        else "-"
+                    ),
+                )
                 if global_step % checkpoint_every == 0:
                     accelerator.save_state(str(run_dir / f"checkpoint-{global_step}"))
                     if accelerator.is_main_process:
@@ -531,6 +623,7 @@ def main() -> None:
                 if global_step >= max_steps:
                     break
 
+    progress_bar.close()
     accelerator.wait_for_everyone()
     final_dir = run_dir / "final"
     accelerator.save_state(str(final_dir))
@@ -543,6 +636,8 @@ def main() -> None:
                     "trainable_parameters": sum(parameter.numel() for parameter in trainable),
                     "lora_parameters": lora_parameter_count,
                     "lighting_encoder_parameters": lighting_parameter_count,
+                    "ddp_parameters": ddp_parameter_count,
+                    "ddp_mode": "trainable_parameters_only",
                     "world_size": accelerator.num_processes,
                     "target_image_seq_len": scheduler_image_seq_len,
                     "dynamic_shift_mu": scheduler_mu,
