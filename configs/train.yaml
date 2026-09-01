@@ -9,7 +9,7 @@ paths:
   resume_checkpoint: null
 
 data:
-  resolution: 512
+  resolution: 960
   exposure: 1.0
   num_workers: 4
   seed: 20260827

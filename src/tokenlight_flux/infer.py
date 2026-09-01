@@ -115,7 +115,7 @@ def main() -> None:
         raise RuntimeError("CUDA is unavailable; FLUX inference requires a CUDA GPU")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     pipeline = FluxKontextPipeline.from_pretrained(
-        model_path, torch_dtype=dtype, local_files_only=True
+        model_path, dtype=dtype, local_files_only=True
     )
     pipeline.load_lora_weights(lora_path, local_files_only=True)
     lighting_state_path = lora_path / "lighting_encoder.safetensors"

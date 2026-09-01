@@ -74,6 +74,51 @@ def make_image_ids(
     return ids
 
 
+def calculate_dynamic_shift(scheduler_config: Any, image_seq_len: int) -> float:
+    """Calculate FLUX's resolution-dependent flow shift from scheduler metadata."""
+    if image_seq_len < 1:
+        raise ValueError(f"image_seq_len must be positive, got {image_seq_len}")
+    required = (
+        "base_image_seq_len",
+        "max_image_seq_len",
+        "base_shift",
+        "max_shift",
+    )
+    missing = [name for name in required if getattr(scheduler_config, name, None) is None]
+    if missing:
+        raise ValueError(
+            "dynamic-shifting scheduler config is incomplete; missing " + ", ".join(missing)
+        )
+    base_seq_len = int(scheduler_config.base_image_seq_len)
+    max_seq_len = int(scheduler_config.max_image_seq_len)
+    if max_seq_len <= base_seq_len:
+        raise ValueError(
+            "scheduler max_image_seq_len must exceed base_image_seq_len, got "
+            f"{max_seq_len} <= {base_seq_len}"
+        )
+    base_shift = float(scheduler_config.base_shift)
+    max_shift = float(scheduler_config.max_shift)
+    slope = (max_shift - base_shift) / float(max_seq_len - base_seq_len)
+    intercept = base_shift - slope * base_seq_len
+    return float(image_seq_len * slope + intercept)
+
+
+def configure_training_timesteps(
+    scheduler: Any,
+    num_train_timesteps: int,
+    image_seq_len: int,
+    device: torch.device,
+) -> float | None:
+    """Build the training sigma schedule, including FLUX dynamic shifting when enabled."""
+    kwargs: dict[str, Any] = {}
+    mu: float | None = None
+    if bool(getattr(scheduler.config, "use_dynamic_shifting", False)):
+        mu = calculate_dynamic_shift(scheduler.config, image_seq_len)
+        kwargs["mu"] = mu
+    scheduler.set_timesteps(num_train_timesteps, device=device, **kwargs)
+    return mu
+
+
 def resolve_resume(config: dict[str, Any], run_dir: Path) -> Path | None:
     value = config["paths"].get("resume_checkpoint")
     if not value:
@@ -203,7 +248,7 @@ def main() -> None:
     accelerator.wait_for_everyone()
 
     pipeline = FluxKontextPipeline.from_pretrained(
-        model_path, torch_dtype=weight_dtype, local_files_only=True
+        model_path, dtype=weight_dtype, local_files_only=True
     )
     transformer = pipeline.transformer
     vae = pipeline.vae
@@ -352,12 +397,14 @@ def main() -> None:
     accelerator.register_load_state_pre_hook(load_hook)
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
 
-    vae.to(accelerator.device, dtype=weight_dtype).eval()
+    # Preserve any per-module dtype choices made by Diffusers while moving the VAE.
+    vae.to(accelerator.device).eval()
     pipeline.vae = vae
 
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipeline.scheduler.config)
     num_train_timesteps = int(getattr(scheduler.config, "num_train_timesteps", 1000))
-    scheduler.set_timesteps(num_train_timesteps, device=accelerator.device)
+    scheduler_image_seq_len: int | None = None
+    scheduler_mu: float | None = None
 
     global_step = 0
     resume_path = resolve_resume(config, run_dir)
@@ -398,6 +445,28 @@ def main() -> None:
                 )
                 clean_target = pack_latents(FluxKontextPipeline, target_latents)
                 condition = pack_latents(FluxKontextPipeline, condition_latents)
+                current_image_seq_len = int(clean_target.shape[1])
+                if scheduler_image_seq_len != current_image_seq_len:
+                    scheduler_mu = configure_training_timesteps(
+                        scheduler,
+                        num_train_timesteps=num_train_timesteps,
+                        image_seq_len=current_image_seq_len,
+                        device=accelerator.device,
+                    )
+                    scheduler_image_seq_len = current_image_seq_len
+                    if accelerator.is_main_process:
+                        print(
+                            json.dumps(
+                                {
+                                    "scheduler": "FlowMatchEulerDiscreteScheduler",
+                                    "resolution": int(config["data"]["resolution"]),
+                                    "target_image_seq_len": scheduler_image_seq_len,
+                                    "dynamic_shift_mu": scheduler_mu,
+                                    "num_train_timesteps": num_train_timesteps,
+                                }
+                            ),
+                            flush=True,
+                        )
                 noise = torch.randn_like(clean_target)
                 timestep_indices = torch.randint(
                     0, num_train_timesteps, (clean_target.shape[0],), device=accelerator.device
@@ -475,6 +544,8 @@ def main() -> None:
                     "lora_parameters": lora_parameter_count,
                     "lighting_encoder_parameters": lighting_parameter_count,
                     "world_size": accelerator.num_processes,
+                    "target_image_seq_len": scheduler_image_seq_len,
+                    "dynamic_shift_mu": scheduler_mu,
                 },
                 indent=2,
             )

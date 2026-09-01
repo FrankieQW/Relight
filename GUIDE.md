@@ -166,7 +166,7 @@ pip install -e .
 
 唯一持久配置是 `configs/train.yaml`。默认值：
 
-- 512×512；
+- 960×960；
 - BF16；
 - FLUX LoRA rank/alpha = 16/16；
 - 34 个 lighting tokens；
@@ -178,8 +178,9 @@ pip install -e .
 - gradient checkpointing 开启；
 - 每 500 optimizer steps 保存 checkpoint。
 
-先用 512 完成 smoke，再考虑 1024。改变分辨率或 lighting schema 时应创建新 run，不要恢复
-旧 optimizer 状态。
+正式配置保持 960。首次部署时可复制一份配置并临时改为 512 完成 smoke；确认显存和训练
+链路后再使用 960。scheduler 会按实际 target token 数计算 dynamic-shifting `mu`。改变分辨率
+或 lighting schema 时应创建新 run，不要恢复旧 optimizer 状态。
 
 ## 8. 服务器检查与单卡 smoke
 
