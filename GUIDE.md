@@ -244,9 +244,18 @@ CUDA_DEVICES=0,1,2,3,4,5,6,7 NUM_PROCESSES=8 MASTER_PORT=29631 \
 
 ```bash
 export NCCL_CUMEM_HOST_ENABLE=0
+export NCCL_CUMEM_ENABLE=0
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
+export NCCL_SHM_DISABLE=1
+export NCCL_NET=Socket
 ```
+
+`scripts/train.sh` 会在多卡训练前先运行一个仅包含单元素
+`all_reduce` 的 NCCL 预检。如果该预检也出现 CUDA 700，故障位于当前
+PyTorch/CUDA/NCCL/驱动或双卡拓扑，而不是 FLUX、LoRA 或数据集代码；此时脚本会在
+加载模型前停止。`NCCL_SHM_DISABLE=1` 会牺牲通信速度换取更保守的本机 Socket
+传输。确认共享内存通信稳定后，可以显式设置 `NCCL_SHM_DISABLE=0` 恢复性能。
 
 输出默认位于：
 
@@ -283,6 +292,32 @@ tensorboard \
   --host 0.0.0.0 \
   --port 6006
 ```
+
+### Validation
+
+训练会从 `paths.validation_manifest` 构建独立的 validation DataLoader，并使用固定
+VAE mode、固定噪声与固定 timestep 进行可重复比较：
+
+```yaml
+train:
+  validation_steps: 500
+  validation_batches: 8
+  validation_seed: 12345
+```
+
+多卡时 `validation_batches` 是每个 rank 最多处理的批次数，损失会跨 rank 汇总。
+TensorBoard 会记录 `validation/loss` 和四种任务各自的 validation loss。
+
+当 `validation/loss` 严格低于历史最佳值时，训练会更新：
+
+```text
+<run_dir>/best_checkpoint/
+<run_dir>/best_validation.json
+```
+
+`best_checkpoint` 保存 LoRA、Lighting Encoder、优化器和随机状态，可用于推理，也可将
+`paths.resume_checkpoint` 指向该目录继续训练。它不会被
+`checkpoints_total_limit` 的普通 checkpoint 清理逻辑删除。
 
 ## 10. 推理
 

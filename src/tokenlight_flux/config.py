@@ -121,6 +121,9 @@ def _validate(config: dict[str, Any]) -> None:
         raise ConfigError("train.mixed_precision must be bf16, fp16, or no")
     if config["train"].get("vae_encode_mode", "mode") not in {"mode", "sample"}:
         raise ConfigError("train.vae_encode_mode must be mode or sample")
+    for name, default in (("validation_steps", 500), ("validation_batches", 8)):
+        if int(config["train"].get(name, default)) < 1:
+            raise ConfigError(f"train.{name} must be positive")
 
 
 def validate_model_snapshot(path_value: str | Path, require_exists: bool = True) -> Path:

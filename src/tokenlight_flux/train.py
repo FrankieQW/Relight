@@ -331,6 +331,7 @@ def main() -> None:
         eps=1.0e-8,
     )
     dataset = TokenLightKontextDataset(config, "train")
+    validation_dataset = TokenLightKontextDataset(config, "validation")
     loader = DataLoader(
         dataset,
         batch_size=int(train_config["micro_batch_size"]),
@@ -340,6 +341,15 @@ def main() -> None:
         collate_fn=collate,
         drop_last=True,
         generator=torch.Generator().manual_seed(int(train_config["seed"])),
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=int(train_config["micro_batch_size"]),
+        shuffle=False,
+        num_workers=int(config["data"].get("num_workers", 0)),
+        pin_memory=True,
+        collate_fn=collate,
+        drop_last=False,
     )
 
     def save_hook(models: list[torch.nn.Module], weights: list[dict[str, torch.Tensor]], path: str) -> None:
@@ -426,7 +436,9 @@ def main() -> None:
     # explicitly. Its LoRA parameters share identity with the registered
     # ParameterList and move together with the backbone.
     transformer.to(accelerator.device)
-    model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+    model, optimizer, loader, validation_loader = accelerator.prepare(
+        model, optimizer, loader, validation_loader
+    )
     if accelerator.is_main_process:
         print(
             json.dumps(
@@ -458,7 +470,18 @@ def main() -> None:
     resume_path = resolve_resume(config, run_dir)
     if resume_path is not None:
         accelerator.load_state(str(resume_path))
-        global_step = int(resume_path.name.rsplit("-", 1)[1])
+        if resume_path.name.startswith("checkpoint-"):
+            global_step = int(resume_path.name.rsplit("-", 1)[1])
+        else:
+            resume_metadata_path = resume_path / "best_validation.json"
+            if not resume_metadata_path.is_file():
+                raise RuntimeError(
+                    "cannot recover global step from nonstandard checkpoint path: "
+                    f"{resume_path}"
+                )
+            global_step = int(
+                json.loads(resume_metadata_path.read_text(encoding="utf-8"))["step"]
+            )
 
     max_steps = int(train_config["max_steps"])
     checkpoint_every = int(train_config["checkpointing_steps"])
@@ -476,6 +499,173 @@ def main() -> None:
         dynamic_ncols=True,
         unit="step",
     )
+    validation_every = int(train_config.get("validation_steps", 500))
+    validation_batches = int(train_config.get("validation_batches", 8))
+    validation_seed = int(train_config.get("validation_seed", 12345))
+    validation_tasks = tuple(config["data"]["tasks"])
+    validation_task_indices = {name: index for index, name in enumerate(validation_tasks)}
+    best_checkpoint_dir = run_dir / "best_checkpoint"
+    best_record_path = run_dir / "best_validation.json"
+    best_validation_loss = float("inf")
+    best_validation_step: int | None = None
+    if best_record_path.is_file() and best_checkpoint_dir.is_dir():
+        best_record = json.loads(best_record_path.read_text(encoding="utf-8"))
+        best_validation_loss = float(best_record["validation_loss"])
+        best_validation_step = int(best_record["step"])
+
+    @torch.no_grad()
+    def run_validation(step: int) -> dict[str, float]:
+        """Evaluate fixed validation samples/noise without updating trainable weights."""
+        nonlocal best_validation_loss, best_validation_step
+        if scheduler_image_seq_len is None:
+            raise RuntimeError("validation cannot run before the training sigma schedule is configured")
+        model.eval()
+        transformer.eval()
+        generator = torch.Generator(device=accelerator.device).manual_seed(validation_seed)
+        # total sum/count followed by one sum/count pair per task
+        stats = torch.zeros(
+            2 + 2 * len(validation_tasks),
+            device=accelerator.device,
+            dtype=torch.float64,
+        )
+        batches_seen = 0
+        for validation_batch in validation_loader:
+            if batches_seen >= validation_batches:
+                break
+            batches_seen += 1
+            target_latents = encode_vae(
+                vae,
+                validation_batch["target_pixel_values"],
+                weight_dtype,
+                "mode",
+            )
+            condition_latents = encode_vae(
+                vae,
+                validation_batch["condition_pixel_values"],
+                weight_dtype,
+                "mode",
+            )
+            context_embeds, pooled_context, context_ids = make_text_free_condition(
+                accelerator.unwrap_model(model).transformer,
+                batch_size=validation_batch["target_pixel_values"].shape[0],
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
+            target_ids = make_image_ids(
+                FluxKontextPipeline, target_latents, accelerator.device, weight_dtype, False
+            )
+            condition_ids = make_image_ids(
+                FluxKontextPipeline, condition_latents, accelerator.device, weight_dtype, True
+            )
+            clean_target = pack_latents(FluxKontextPipeline, target_latents)
+            condition = pack_latents(FluxKontextPipeline, condition_latents)
+            if int(clean_target.shape[1]) != scheduler_image_seq_len:
+                raise RuntimeError(
+                    "validation image sequence length differs from training: "
+                    f"validation={clean_target.shape[1]}, training={scheduler_image_seq_len}"
+                )
+            noise = torch.randn(
+                clean_target.shape,
+                generator=generator,
+                device=clean_target.device,
+                dtype=clean_target.dtype,
+            )
+            timestep_indices = torch.randint(
+                0,
+                num_train_timesteps,
+                (clean_target.shape[0],),
+                generator=generator,
+                device=accelerator.device,
+            )
+            timesteps = scheduler.timesteps[timestep_indices].to(dtype=weight_dtype)
+            sigmas = scheduler.sigmas[timestep_indices].to(
+                device=accelerator.device, dtype=clean_target.dtype
+            ).view(-1, *([1] * (clean_target.ndim - 1)))
+            noisy_target = (1.0 - sigmas) * clean_target + sigmas * noise
+            hidden_states = torch.cat((noisy_target, condition), dim=1)
+            image_ids = torch.cat((target_ids, condition_ids), dim=-2)
+            raw_transformer = accelerator.unwrap_model(model).transformer
+            guidance = None
+            if bool(getattr(raw_transformer.config, "guidance_embeds", False)):
+                guidance = torch.full(
+                    (hidden_states.shape[0],),
+                    guidance_scale,
+                    device=accelerator.device,
+                    dtype=weight_dtype,
+                )
+            autocast = (
+                torch.autocast("cuda", dtype=weight_dtype)
+                if accelerator.device.type == "cuda" and mixed_precision != "no"
+                else nullcontext()
+            )
+            with autocast:
+                prediction = model(
+                    hidden_states=hidden_states,
+                    timestep=timesteps / 1000.0,
+                    guidance=guidance,
+                    pooled_projections=pooled_context,
+                    encoder_hidden_states=context_embeds,
+                    txt_ids=context_ids,
+                    img_ids=image_ids,
+                    lighting_values=validation_batch["lighting_values"],
+                    lighting_known=validation_batch["lighting_known"],
+                    lighting_valid=validation_batch["lighting_valid"],
+                    lighting_task_ids=validation_batch["lighting_task_ids"],
+                    return_dict=False,
+                )[0]
+                prediction = prediction[:, : clean_target.shape[1]]
+                flow_target = noise - clean_target
+                sample_losses = (prediction.float() - flow_target.float()).square().flatten(1).mean(1)
+
+            stats[0] += sample_losses.double().sum()
+            stats[1] += sample_losses.numel()
+            for sample_index, task_name in enumerate(validation_batch["task_name"]):
+                task_index = validation_task_indices[str(task_name)]
+                offset = 2 + 2 * task_index
+                stats[offset] += sample_losses[sample_index].double()
+                stats[offset + 1] += 1
+
+        stats = accelerator.reduce(stats, reduction="sum")
+        if stats[1].item() == 0:
+            raise RuntimeError("validation loader produced no samples")
+        metrics = {"validation/loss": float((stats[0] / stats[1]).item())}
+        for task_index, task_name in enumerate(validation_tasks):
+            offset = 2 + 2 * task_index
+            if stats[offset + 1].item() > 0:
+                metrics[f"validation/{task_name}_loss"] = float(
+                    (stats[offset] / stats[offset + 1]).item()
+                )
+        accelerator.log(metrics, step=step)
+        current_validation_loss = metrics["validation/loss"]
+        is_best = current_validation_loss < best_validation_loss
+        if is_best:
+            best_validation_loss = current_validation_loss
+            best_validation_step = step
+        if accelerator.is_main_process:
+            progress_bar.write(
+                f"validation step={step} loss={metrics['validation/loss']:.6f} "
+                f"samples={int(stats[1].item())} best={is_best}"
+            )
+        model.train()
+        transformer.train()
+        if is_best:
+            accelerator.save_state(str(best_checkpoint_dir))
+            if accelerator.is_main_process:
+                best_record = {
+                    "step": step,
+                    "validation_loss": current_validation_loss,
+                    "sample_count": int(stats[1].item()),
+                    "metrics": metrics,
+                    "checkpoint": str(best_checkpoint_dir),
+                }
+                serialized_record = json.dumps(best_record, indent=2) + "\n"
+                best_record_path.write_text(serialized_record, encoding="utf-8")
+                (best_checkpoint_dir / "best_validation.json").write_text(
+                    serialized_record,
+                    encoding="utf-8",
+                )
+            accelerator.wait_for_everyone()
+        return metrics
 
     while global_step < max_steps:
         for batch in loader:
@@ -616,6 +806,8 @@ def main() -> None:
                         else "-"
                     ),
                 )
+                if global_step % validation_every == 0:
+                    run_validation(global_step)
                 if global_step % checkpoint_every == 0:
                     accelerator.save_state(str(run_dir / f"checkpoint-{global_step}"))
                     if accelerator.is_main_process:
@@ -641,6 +833,11 @@ def main() -> None:
                     "world_size": accelerator.num_processes,
                     "target_image_seq_len": scheduler_image_seq_len,
                     "dynamic_shift_mu": scheduler_mu,
+                    "best_validation_loss": (
+                        best_validation_loss if best_validation_step is not None else None
+                    ),
+                    "best_validation_step": best_validation_step,
+                    "best_checkpoint": str(best_checkpoint_dir),
                 },
                 indent=2,
             )
