@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 TASK_NAMES = ("ambient_scale", "global_diffuse", "add_light", "in_scene_light")
@@ -163,6 +164,73 @@ class LightingTokenEncoder(nn.Module):
         return self.output_norm(tokens)
 
 
+class FixtureMaskEncoder(nn.Module):
+    """Compress a full-resolution fixture mask into spatial FLUX context tokens."""
+
+    def __init__(self, context_dim: int, hidden_dim: int, stride: int):
+        super().__init__()
+        if context_dim < 1 or hidden_dim < 1 or stride < 1:
+            raise ValueError("fixture context_dim, hidden_dim and stride must be positive")
+        self.context_dim = int(context_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.stride = int(stride)
+        # Average occupancy preserves coverage; max occupancy keeps small fixtures
+        # from disappearing; presence distinguishes real and null masks.
+        self.projection = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, context_dim),
+        )
+        self.type_embedding = nn.Parameter(torch.empty(context_dim))
+        self.output_norm = nn.LayerNorm(context_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.type_embedding, std=0.02)
+        for module in self.projection:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        fixture_mask: torch.Tensor,
+        fixture_present: torch.Tensor,
+    ) -> tuple[torch.Tensor, int, int]:
+        if fixture_mask.ndim != 4 or fixture_mask.shape[1] != 1:
+            raise ValueError(
+                "fixture_mask must have shape [B, 1, H, W], got "
+                f"{tuple(fixture_mask.shape)}"
+            )
+        if fixture_present.shape != (fixture_mask.shape[0],):
+            raise ValueError(
+                f"fixture_present must have shape [{fixture_mask.shape[0]}]"
+            )
+        height, width = fixture_mask.shape[-2:]
+        if height % 16 or width % 16:
+            raise ValueError("fixture mask dimensions must be divisible by 16")
+        packed_height, packed_width = height // 16, width // 16
+        if packed_height % self.stride or packed_width % self.stride:
+            raise ValueError(
+                "packed fixture grid must be divisible by fixture stride: "
+                f"grid=({packed_height}, {packed_width}), stride={self.stride}"
+            )
+        grid_height = packed_height // self.stride
+        grid_width = packed_width // self.stride
+        device = self.type_embedding.device
+        mask = fixture_mask.to(device=device, dtype=torch.float32).clamp_(0.0, 1.0)
+        present = fixture_present.to(device=device, dtype=torch.float32)
+        average = F.adaptive_avg_pool2d(mask, (grid_height, grid_width))
+        maximum = F.adaptive_max_pool2d(mask, (grid_height, grid_width))
+        present_grid = present[:, None, None, None].expand_as(average)
+        features = torch.cat((average, maximum, present_grid), dim=1)
+        features = features.permute(0, 2, 3, 1).reshape(mask.shape[0], -1, 3)
+        projection_dtype = self.projection[0].weight.dtype
+        tokens = self.projection(features.to(dtype=projection_dtype))
+        tokens = tokens + self.type_embedding.view(1, 1, -1)
+        return self.output_norm(tokens), grid_height, grid_width
+
+
 class LightingConditionedTransformer(nn.Module):
     """Use lighting tokens as FLUX context before joint attention."""
 
@@ -170,6 +238,7 @@ class LightingConditionedTransformer(nn.Module):
         self,
         transformer: nn.Module,
         lighting_encoder: LightingTokenEncoder,
+        fixture_mask_encoder: FixtureMaskEncoder | None = None,
         *,
         ddp_trainable_only: bool = False,
     ):
@@ -188,6 +257,7 @@ class LightingConditionedTransformer(nn.Module):
         else:
             self.transformer = transformer
         self.lighting_encoder = lighting_encoder
+        self.fixture_mask_encoder = fixture_mask_encoder
         self.ddp_trainable_only = bool(ddp_trainable_only)
 
     @property
@@ -214,6 +284,8 @@ class LightingConditionedTransformer(nn.Module):
         lighting_known: torch.Tensor | None = None,
         lighting_valid: torch.Tensor | None = None,
         lighting_task_ids: torch.Tensor | None = None,
+        fixture_mask: torch.Tensor | None = None,
+        fixture_present: torch.Tensor | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
         **kwargs,
     ):
@@ -222,6 +294,8 @@ class LightingConditionedTransformer(nn.Module):
         lighting_known = attention_kwargs.pop("tokenlight_known", lighting_known)
         lighting_valid = attention_kwargs.pop("tokenlight_valid", lighting_valid)
         lighting_task_ids = attention_kwargs.pop("tokenlight_task_ids", lighting_task_ids)
+        fixture_mask = attention_kwargs.pop("tokenlight_fixture_mask", fixture_mask)
+        fixture_present = attention_kwargs.pop("tokenlight_fixture_present", fixture_present)
         if any(value is None for value in (lighting_values, lighting_known, lighting_valid, lighting_task_ids)):
             raise ValueError("all four lighting conditioning tensors are required")
 
@@ -235,6 +309,27 @@ class LightingConditionedTransformer(nn.Module):
             txt_ids, lighting_tokens.shape[0], lighting_tokens.shape[1]
         )
         txt_ids = torch.cat((txt_ids, lighting_ids), dim=-2)
+        if self.fixture_mask_encoder is not None:
+            if fixture_mask is None or fixture_present is None:
+                raise ValueError("fixture_mask and fixture_present are required")
+            fixture_tokens, grid_height, grid_width = self.fixture_mask_encoder(
+                fixture_mask, fixture_present
+            )
+            fixture_tokens = fixture_tokens.to(
+                device=encoder_hidden_states.device,
+                dtype=encoder_hidden_states.dtype,
+            )
+            fixture_ids = self._fixture_ids(
+                txt_ids,
+                fixture_tokens.shape[0],
+                grid_height,
+                grid_width,
+                self.fixture_mask_encoder.stride,
+            )
+            encoder_hidden_states = torch.cat((encoder_hidden_states, fixture_tokens), dim=1)
+            txt_ids = torch.cat((txt_ids, fixture_ids), dim=-2)
+        elif fixture_present is not None and bool(fixture_present.any().item()):
+            raise ValueError("checkpoint has no FixtureMaskEncoder for an active fixture mask")
         return self.transformer(
             *args,
             encoder_hidden_states=encoder_hidden_states,
@@ -257,4 +352,30 @@ class LightingConditionedTransformer(nn.Module):
         )
         ids[..., 0] = 2
         ids[..., 1] = torch.arange(token_count, device=txt_ids.device, dtype=txt_ids.dtype)
+        return ids
+
+    @staticmethod
+    def _fixture_ids(
+        txt_ids: torch.Tensor,
+        batch_size: int,
+        grid_height: int,
+        grid_width: int,
+        stride: int,
+    ) -> torch.Tensor:
+        if txt_ids.ndim not in (2, 3) or txt_ids.shape[-1] != 3:
+            raise ValueError(f"unexpected txt_ids shape: {tuple(txt_ids.shape)}")
+        y = (torch.arange(grid_height, device=txt_ids.device, dtype=txt_ids.dtype) + 0.5) * stride - 0.5
+        x = (torch.arange(grid_width, device=txt_ids.device, dtype=txt_ids.dtype) + 0.5) * stride - 0.5
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        ids = torch.zeros(
+            grid_height * grid_width,
+            3,
+            device=txt_ids.device,
+            dtype=txt_ids.dtype,
+        )
+        ids[:, 0] = 3
+        ids[:, 1] = yy.reshape(-1)
+        ids[:, 2] = xx.reshape(-1)
+        if txt_ids.ndim == 3:
+            ids = ids.unsqueeze(0).expand(batch_size, -1, -1)
         return ids

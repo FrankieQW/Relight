@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from .config import REQUIRED_MODEL_ENTRIES, load_config, validate_model_snapshot
 from .dataset import TokenLightKontextDataset, collate
 from .lighting import (
+    FixtureMaskEncoder,
     LightingConditionedTransformer,
     LightingSchema,
     LightingTokenEncoder,
@@ -167,6 +168,8 @@ def print_contract(config: dict[str, Any]) -> None:
                 "lighting_token_count": len(schema.names),
                 "lighting_schema": list(schema.names),
                 "lighting_fourier_features": int(config["lighting"]["fourier_features"]),
+                "fixture_mask_enabled": bool(config["model"]["fixture_mask_enabled"]),
+                "fixture_mask_stride": int(config["model"]["fixture_mask_stride"]),
                 "network_access": "disabled by local_files_only=True",
             },
             ensure_ascii=False,
@@ -199,6 +202,8 @@ def inspect_data(config: dict[str, Any]) -> None:
                     "lighting_token_count": int(sample["lighting_values"].numel()),
                     "lighting_known_count": int(sample["lighting_known"].sum()),
                     "lighting_valid_count": int(sample["lighting_valid"].sum()),
+                    "fixture_present": bool(sample["fixture_present"]),
+                    "fixture_mask_pixels": float(sample["fixture_mask"].sum()),
                     "scene_id": sample["scene_id"],
                     "sample_seed": sample["sample_seed"],
                 },
@@ -292,9 +297,17 @@ def main() -> None:
         fourier_sigma=float(lighting_config["fourier_sigma"]),
         fourier_seed=int(lighting_config["fourier_seed"]),
     )
+    fixture_mask_encoder = None
+    if bool(config["model"]["fixture_mask_enabled"]):
+        fixture_mask_encoder = FixtureMaskEncoder(
+            context_dim=context_dim,
+            hidden_dim=int(config["model"]["fixture_mask_hidden_dim"]),
+            stride=int(config["model"]["fixture_mask_stride"]),
+        )
     model = LightingConditionedTransformer(
         transformer,
         lighting_encoder,
+        fixture_mask_encoder,
         ddp_trainable_only=True,
     )
     # Text is not a model condition in this method. Drop the pretrained text
@@ -313,8 +326,15 @@ def main() -> None:
         parameter.numel() for parameter in transformer.parameters() if parameter.requires_grad
     )
     lighting_parameter_count = sum(parameter.numel() for parameter in lighting_encoder.parameters())
+    fixture_mask_parameter_count = (
+        sum(parameter.numel() for parameter in fixture_mask_encoder.parameters())
+        if fixture_mask_encoder is not None
+        else 0
+    )
     ddp_parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    expected_ddp_parameter_count = lora_parameter_count + lighting_parameter_count
+    expected_ddp_parameter_count = (
+        lora_parameter_count + lighting_parameter_count + fixture_mask_parameter_count
+    )
     if ddp_parameter_count != expected_ddp_parameter_count:
         raise RuntimeError(
             "DDP parameter contract mismatch: "
@@ -366,6 +386,15 @@ def main() -> None:
                 for key, value in unwrapped.lighting_encoder.state_dict().items()
             }
             save_file(lighting_state, str(Path(path) / "lighting_encoder.safetensors"))
+            if unwrapped.fixture_mask_encoder is not None:
+                fixture_state = {
+                    key: value.detach().cpu().contiguous()
+                    for key, value in unwrapped.fixture_mask_encoder.state_dict().items()
+                }
+                save_file(
+                    fixture_state,
+                    str(Path(path) / "fixture_mask_encoder.safetensors"),
+                )
             (Path(path) / "lighting_config.json").write_text(
                 json.dumps(
                     {
@@ -376,6 +405,11 @@ def main() -> None:
                         "fourier_features": int(lighting_config["fourier_features"]),
                         "fourier_sigma": float(lighting_config["fourier_sigma"]),
                         "fourier_seed": int(lighting_config["fourier_seed"]),
+                        "fixture_mask_enabled": fixture_mask_encoder is not None,
+                        "fixture_mask_stride": int(config["model"]["fixture_mask_stride"]),
+                        "fixture_mask_hidden_dim": int(
+                            config["model"]["fixture_mask_hidden_dim"]
+                        ),
                         "text_conditioning": False,
                     },
                     indent=2,
@@ -418,6 +452,9 @@ def main() -> None:
             "fourier_features": int(lighting_config["fourier_features"]),
             "fourier_sigma": float(lighting_config["fourier_sigma"]),
             "fourier_seed": int(lighting_config["fourier_seed"]),
+            "fixture_mask_enabled": fixture_mask_encoder is not None,
+            "fixture_mask_stride": int(config["model"]["fixture_mask_stride"]),
+            "fixture_mask_hidden_dim": int(config["model"]["fixture_mask_hidden_dim"]),
             "text_conditioning": False,
         }
         if metadata != expected_metadata:
@@ -429,6 +466,20 @@ def main() -> None:
         )
         if missing or unexpected:
             raise RuntimeError(f"lighting checkpoint mismatch: missing={missing}, unexpected={unexpected}")
+        if model.fixture_mask_encoder is not None:
+            fixture_path = Path(path) / "fixture_mask_encoder.safetensors"
+            if not fixture_path.is_file():
+                raise RuntimeError(
+                    "checkpoint predates fixture-mask conditioning and cannot be resumed "
+                    f"with model.fixture_mask_enabled=true: {fixture_path}"
+                )
+            missing, unexpected = model.fixture_mask_encoder.load_state_dict(
+                load_file(str(fixture_path), device="cpu"), strict=True
+            )
+            if missing or unexpected:
+                raise RuntimeError(
+                    f"fixture-mask checkpoint mismatch: missing={missing}, unexpected={unexpected}"
+                )
 
     accelerator.register_save_state_pre_hook(save_hook)
     accelerator.register_load_state_pre_hook(load_hook)
@@ -447,6 +498,7 @@ def main() -> None:
                     "ddp_parameter_count": ddp_parameter_count,
                     "lora_parameter_count": lora_parameter_count,
                     "lighting_encoder_parameter_count": lighting_parameter_count,
+                    "fixture_mask_encoder_parameter_count": fixture_mask_parameter_count,
                     "frozen_backbone_parameter_count": sum(
                         parameter.numel()
                         for parameter in transformer.parameters()
@@ -522,9 +574,9 @@ def main() -> None:
         model.eval()
         transformer.eval()
         generator = torch.Generator(device=accelerator.device).manual_seed(validation_seed)
-        # total sum/count followed by one sum/count pair per task
+        # total sum/count, one sum/count pair per task, then ablated-mask sum/count
         stats = torch.zeros(
-            2 + 2 * len(validation_tasks),
+            4 + 2 * len(validation_tasks),
             device=accelerator.device,
             dtype=torch.float64,
         )
@@ -611,11 +663,43 @@ def main() -> None:
                     lighting_known=validation_batch["lighting_known"],
                     lighting_valid=validation_batch["lighting_valid"],
                     lighting_task_ids=validation_batch["lighting_task_ids"],
+                    fixture_mask=validation_batch["fixture_mask"],
+                    fixture_present=validation_batch["fixture_present"],
                     return_dict=False,
                 )[0]
                 prediction = prediction[:, : clean_target.shape[1]]
                 flow_target = noise - clean_target
                 sample_losses = (prediction.float() - flow_target.float()).square().flatten(1).mean(1)
+
+                in_scene_indices = [
+                    index
+                    for index, name in enumerate(validation_batch["task_name"])
+                    if str(name) == "in_scene_light"
+                ]
+                if in_scene_indices and fixture_mask_encoder is not None:
+                    ablated_prediction = model(
+                        hidden_states=hidden_states,
+                        timestep=timesteps / 1000.0,
+                        guidance=guidance,
+                        pooled_projections=pooled_context,
+                        encoder_hidden_states=context_embeds,
+                        txt_ids=context_ids,
+                        img_ids=image_ids,
+                        lighting_values=validation_batch["lighting_values"],
+                        lighting_known=validation_batch["lighting_known"],
+                        lighting_valid=validation_batch["lighting_valid"],
+                        lighting_task_ids=validation_batch["lighting_task_ids"],
+                        fixture_mask=torch.zeros_like(validation_batch["fixture_mask"]),
+                        fixture_present=torch.zeros_like(validation_batch["fixture_present"]),
+                        return_dict=False,
+                    )[0]
+                    ablated_prediction = ablated_prediction[:, : clean_target.shape[1]]
+                    ablated_losses = (
+                        (ablated_prediction.float() - flow_target.float())
+                        .square()
+                        .flatten(1)
+                        .mean(1)
+                    )
 
             stats[0] += sample_losses.double().sum()
             stats[1] += sample_losses.numel()
@@ -624,6 +708,11 @@ def main() -> None:
                 offset = 2 + 2 * task_index
                 stats[offset] += sample_losses[sample_index].double()
                 stats[offset + 1] += 1
+            if in_scene_indices and fixture_mask_encoder is not None:
+                ablation_offset = 2 + 2 * len(validation_tasks)
+                selected = ablated_losses[in_scene_indices]
+                stats[ablation_offset] += selected.double().sum()
+                stats[ablation_offset + 1] += selected.numel()
 
         stats = accelerator.reduce(stats, reduction="sum")
         if stats[1].item() == 0:
@@ -634,6 +723,17 @@ def main() -> None:
             if stats[offset + 1].item() > 0:
                 metrics[f"validation/{task_name}_loss"] = float(
                     (stats[offset] / stats[offset + 1]).item()
+                )
+        ablation_offset = 2 + 2 * len(validation_tasks)
+        if stats[ablation_offset + 1].item() > 0:
+            ablated_loss = float(
+                (stats[ablation_offset] / stats[ablation_offset + 1]).item()
+            )
+            in_scene_loss = metrics.get("validation/in_scene_light_loss")
+            if in_scene_loss is not None:
+                metrics["validation/in_scene_mask_ablated_loss"] = ablated_loss
+                metrics["validation/in_scene_mask_ablation_gap"] = (
+                    ablated_loss - in_scene_loss
                 )
         accelerator.log(metrics, step=step)
         current_validation_loss = metrics["validation/loss"]
@@ -754,6 +854,8 @@ def main() -> None:
                         lighting_known=batch["lighting_known"],
                         lighting_valid=batch["lighting_valid"],
                         lighting_task_ids=batch["lighting_task_ids"],
+                        fixture_mask=batch["fixture_mask"],
+                        fixture_present=batch["fixture_present"],
                         return_dict=False,
                     )[0]
                     prediction = prediction[:, : clean_target.shape[1]]
@@ -828,6 +930,7 @@ def main() -> None:
                     "trainable_parameters": sum(parameter.numel() for parameter in trainable),
                     "lora_parameters": lora_parameter_count,
                     "lighting_encoder_parameters": lighting_parameter_count,
+                    "fixture_mask_encoder_parameters": fixture_mask_parameter_count,
                     "ddp_parameters": ddp_parameter_count,
                     "ddp_mode": "trainable_parameters_only",
                     "world_size": accelerator.num_processes,

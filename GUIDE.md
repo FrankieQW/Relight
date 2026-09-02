@@ -144,9 +144,11 @@ lighting token        position ID 第一轴 = 2，第二轴 = scalar token index
 模型不接收自然语言。任务类型由 learned task embedding 表示，连续数值只来自 lighting
 tokens。
 
-fixture mask 当前不输入模型。`in_scene_light` 的二维灯具位置来自 condition image 中可见的
-灯具，颜色、强度和 transition 来自 lighting tokens。若必须显式输入 mask，需要再增加
-mask adapter。
+fixture mask 现在经过与图像一致的中心裁剪和 resize，再从 960×960 压缩为 15×15
+网格。每个网格 token 包含 average occupancy、max occupancy 和 fixture-present 位，经
+MLP 投影到 FLUX context dimension。它的位置 ID 为 `[3, y, x]`，因此 joint attention
+可以把灯具二维位置与 target/source image tokens 对齐。非 `in_scene_light` 样本输入全零
+mask 和 `fixture_present=false`。
 
 ## 6. 创建独立环境
 
@@ -175,7 +177,7 @@ pip install -e .
 - 每卡 micro batch = 1；
 - gradient accumulation = 4；
 - 8 卡 global batch = `1 × 4 × 8 = 32`；
-- gradient checkpointing 开启；
+- gradient checkpointing 默认关闭（显存不足时可在配置中开启）；
 - 每 500 optimizer steps 保存 checkpoint。
 
 正式配置保持 960。首次部署时可复制一份配置并临时改为 512 完成 smoke；确认显存和训练
@@ -206,9 +208,15 @@ CUDA_DEVICES=0 NUM_PROCESSES=1 \
 ```text
 pytorch_lora_weights.safetensors
 lighting_encoder.safetensors
+fixture_mask_encoder.safetensors
 lighting_config.json
 optimizer/state/RNG files written by Accelerate
 ```
+
+fixture-mask 编码器是新增的可训练模块，因此启用它后不要用旧版
+`flux_kontext_tokenlight_lora_no_text` checkpoint 做完整断点续训。默认配置使用新的
+`flux_kontext_tokenlight_lora_fixture_mask` 运行目录并从基础模型重新开始；新格式
+checkpoint 之间可以正常续训。
 
 再检查恢复：
 
@@ -260,7 +268,7 @@ PyTorch/CUDA/NCCL/驱动或双卡拓扑，而不是 FLUX、LoRA 或数据集代�
 输出默认位于：
 
 ```text
-/mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora_no_text/
+/mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora_fixture_mask/
 ├── config.yaml
 ├── tensorboard/
 ├── checkpoint-500/
@@ -288,7 +296,7 @@ system/max_memory_reserved_gib
 
 ```bash
 tensorboard \
-  --logdir /mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora_no_text/tensorboard \
+  --logdir /mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora_fixture_mask/tensorboard \
   --host 0.0.0.0 \
   --port 6006
 ```
@@ -307,6 +315,9 @@ train:
 
 多卡时 `validation_batches` 是每个 rank 最多处理的批次数，损失会跨 rank 汇总。
 TensorBoard 会记录 `validation/loss` 和四种任务各自的 validation loss。
+启用 fixture mask 后还会记录 `validation/in_scene_mask_ablated_loss` 和
+`validation/in_scene_mask_ablation_gap`。后者等于“零 mask 损失减正确 mask 损失”；持续
+大于 0 才说明模型确实利用了 mask 空间条件。
 
 当 `validation/loss` 严格低于历史最佳值时，训练会更新：
 
@@ -323,9 +334,34 @@ TensorBoard 会记录 `validation/loss` 和四种任务各自的 validation loss
 
 ### Ambient scale
 
+专用 ambient 推理入口只需要输入 ambient EXR、LoRA 目录和输出路径：
+
+```bash
+python infer_ambient.py \
+  /path/to/component/ambient.exr \
+  /path/to/best_checkpoint \
+  /path/to/ambient_sweep.png
+```
+
+输出是无文字、无间隔的六图横向拼接，顺序为原始 ambient、scale 0、0.375、
+0.75、1.125、1.5。五次生成使用相同 seed，并且模型只加载一次。可选参数包括
+`--steps`、`--guidance-scale`、`--seed`、`--cpu-offload` 和 `--config`。
+
+要查看训练数据管线实际构造的对应 GT（不经过模型），运行：
+
+```bash
+PYTHONPATH=src python visualize_ambient_training_sweep.py \
+  /path/to/component/ambient.exr \
+  /path/to/ambient_training_sweep.png
+```
+
+脚本默认读取 ambient 同目录的 `dark.exr`，也可用 `--dark` 显式指定。输出顺序同样是
+ambient、scale 0、0.375、0.75、1.125、1.5，并严格复现训练中的
+`dark + (ambient-dark) * scale`、exposure、中心裁剪、Reinhard 和 resize。
+
 ```bash
 bash scripts/infer.sh \
-  --lora /mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora_no_text/final \
+  --lora /mnt/afs_fangwenqi/new_method/outputs/flux_kontext_tokenlight_lora_fixture_mask/final \
   --source /path/to/component/ambient.exr \
   --output /mnt/afs_fangwenqi/tokenlighttest/ambient_05.png \
   --task ambient_scale \
@@ -365,6 +401,7 @@ bash scripts/infer.sh \
   --source /path/to/source.exr \
   --output /path/to/result.png \
   --task in_scene_light \
+  --fixture-mask /path/to/fixture_000_mask.png \
   --fixture-rgb '1.0,0.8,0.5' \
   --fixture-intensity 1.0 \
   --fixture-transition 1.0

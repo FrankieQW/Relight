@@ -52,6 +52,7 @@ class TokenLightKontextDataset(Dataset):
         self.tasks = tuple(data["tasks"])
         self.task_probabilities = dict(data["task_probabilities"])
         self.max_lights = int(config["model"]["max_lights"])
+        self.fixture_mask_enabled = bool(config["model"]["fixture_mask_enabled"])
         self.schema = LightingSchema(self.max_lights)
         self.ambient_range = _range(config, "ambient_scale")
         self.color_range = _range(config, "light_color")
@@ -81,6 +82,22 @@ class TokenLightKontextDataset(Dataset):
         dark = self._read_linear(scene["dark"]) if scene.get("dark") else np.zeros_like(ambient)
         source, target, control = self._compose(scene, task, ambient, dark, rng)
         lighting = self.schema.pack(task, control)
+        fixture_present = task == "in_scene_light" and self.fixture_mask_enabled
+        if fixture_present:
+            mask_value = control.get("fixture_mask")
+            if not mask_value:
+                raise ValueError(f"in_scene_light sample has no fixture mask: {scene.get('id')}")
+            fixture_mask = self._read_mask(mask_value)
+            if fixture_mask.shape != ambient.shape[:2]:
+                raise ValueError(
+                    "fixture mask shape differs from ambient image: "
+                    f"{fixture_mask.shape} != {ambient.shape[:2]}"
+                )
+        else:
+            fixture_mask = np.zeros(ambient.shape[:2], dtype=np.float32)
+        prepared_mask = self._prepare_mask(fixture_mask)
+        if fixture_present and float(prepared_mask.max()) <= 0.0:
+            raise ValueError(f"in_scene_light fixture mask is empty: {scene.get('id')}")
         return {
             "condition_pixel_values": torch.from_numpy(self._prepare_image(source)).permute(2, 0, 1),
             "target_pixel_values": torch.from_numpy(self._prepare_image(target)).permute(2, 0, 1),
@@ -88,6 +105,8 @@ class TokenLightKontextDataset(Dataset):
             "lighting_known": torch.from_numpy(lighting.known.copy()),
             "lighting_valid": torch.from_numpy(lighting.valid.copy()),
             "lighting_task_id": torch.tensor(lighting.task_id, dtype=torch.long),
+            "fixture_mask": torch.from_numpy(prepared_mask)[None],
+            "fixture_present": torch.tensor(fixture_present, dtype=torch.bool),
             "control": control,
             "task_name": task,
             "scene_id": str(scene["id"]),
@@ -148,7 +167,7 @@ class TokenLightKontextDataset(Dataset):
                 )
             return ambient, target, {"lights": lights}
 
-        fixtures = self._fixtures(scene)
+        fixtures = self._usable_fixtures(scene)
         fixture = fixtures[int(rng.integers(len(fixtures)))]
         color = rng.uniform(*self.color_range, size=3).astype(np.float32)
         intensity = float(rng.uniform(*self.fixture_intensity_range))
@@ -171,7 +190,17 @@ class TokenLightKontextDataset(Dataset):
             return len(scene.get("diffuse", [])) >= 2
         if task == "add_light":
             return bool(scene.get("point_lights"))
-        return any(item.get("path") or item.get("on") for item in self._fixtures(scene))
+        return bool(self._usable_fixtures(scene))
+
+    def _usable_fixtures(self, scene: dict[str, Any]) -> list[dict[str, Any]]:
+        fixtures = [
+            item
+            for item in self._fixtures(scene)
+            if item.get("path") or item.get("on")
+        ]
+        if self.fixture_mask_enabled:
+            fixtures = [item for item in fixtures if item.get("mask")]
+        return fixtures
 
     @staticmethod
     def _fixtures(scene: dict[str, Any]) -> list[dict[str, Any]]:
@@ -208,6 +237,35 @@ class TokenLightKontextDataset(Dataset):
             image = cv2.resize(image, (self.resolution, self.resolution), interpolation=cv2.INTER_AREA)
         return np.ascontiguousarray(image * 2.0 - 1.0, dtype=np.float32)
 
+    def _read_mask(self, value: str | Path) -> np.ndarray:
+        path = self._resolve(value)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise RuntimeError(f"cannot read fixture mask: {path}")
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        original_dtype = mask.dtype
+        mask = mask.astype(np.float32)
+        if np.issubdtype(original_dtype, np.integer):
+            mask /= float(np.iinfo(original_dtype).max)
+        elif float(mask.max(initial=0.0)) > 1.0:
+            mask /= 255.0
+        if not np.isfinite(mask).all():
+            raise ValueError(f"fixture mask contains NaN/Inf: {path}")
+        return np.clip(mask, 0.0, 1.0)
+
+    def _prepare_mask(self, mask: np.ndarray) -> np.ndarray:
+        mask = center_crop(mask)
+        if mask.shape != (self.resolution, self.resolution):
+            mask = cv2.resize(
+                mask,
+                (self.resolution, self.resolution),
+                interpolation=cv2.INTER_AREA,
+            )
+        return np.ascontiguousarray(np.clip(mask, 0.0, 1.0), dtype=np.float32)
+
 
 def center_crop(array: np.ndarray) -> np.ndarray:
     height, width = array.shape[:2]
@@ -238,6 +296,35 @@ def load_condition_image(path: str | Path, resolution: int, exposure: float) -> 
     return Image.fromarray(np.clip(mapped * 255.0 + 0.5, 0, 255).astype(np.uint8), mode="RGB")
 
 
+def load_fixture_mask(path: str | Path, resolution: int) -> torch.Tensor:
+    """Load a fixture mask with the same center crop/resize geometry as training."""
+    mask_path = Path(path).expanduser()
+    if not mask_path.is_file():
+        raise FileNotFoundError(mask_path)
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+    if mask is None:
+        raise RuntimeError(f"cannot read fixture mask: {mask_path}")
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    original_dtype = mask.dtype
+    mask = mask.astype(np.float32)
+    if np.issubdtype(original_dtype, np.integer):
+        mask /= float(np.iinfo(original_dtype).max)
+    elif float(mask.max(initial=0.0)) > 1.0:
+        mask /= 255.0
+    mask = center_crop(np.clip(mask, 0.0, 1.0))
+    if mask.shape != (resolution, resolution):
+        mask = cv2.resize(
+            mask,
+            (resolution, resolution),
+            interpolation=cv2.INTER_AREA,
+        )
+    mask = np.ascontiguousarray(np.clip(mask, 0.0, 1.0), dtype=np.float32)
+    if not np.isfinite(mask).all() or float(mask.max(initial=0.0)) <= 0.0:
+        raise ValueError(f"fixture mask is empty or invalid: {mask_path}")
+    return torch.from_numpy(mask)[None]
+
+
 def collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
     if not samples:
         raise ValueError("cannot collate an empty batch")
@@ -248,6 +335,8 @@ def collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "lighting_known": torch.stack([sample["lighting_known"] for sample in samples]),
         "lighting_valid": torch.stack([sample["lighting_valid"] for sample in samples]),
         "lighting_task_ids": torch.stack([sample["lighting_task_id"] for sample in samples]),
+        "fixture_mask": torch.stack([sample["fixture_mask"] for sample in samples]),
+        "fixture_present": torch.stack([sample["fixture_present"] for sample in samples]),
         "control": [sample["control"] for sample in samples],
         "task_name": [sample["task_name"] for sample in samples],
         "scene_id": [sample["scene_id"] for sample in samples],

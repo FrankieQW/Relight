@@ -32,6 +32,9 @@ data:
 
 model:
   max_lights: 3
+  fixture_mask_enabled: true
+  fixture_mask_stride: 4
+  fixture_mask_hidden_dim: 128
 
 lighting:
   hidden_dim: 512
@@ -71,11 +74,11 @@ train:
   validation_steps: 500
   validation_batches: 8
   validation_seed: 12345
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   guidance_scale: 3.5
   vae_encode_mode: mode
   seed: 42
-  run_name: flux_kontext_tokenlight_lora_no_text
+  run_name: flux_kontext_tokenlight_lora_fixture_mask
 
 infer:
   steps: 28

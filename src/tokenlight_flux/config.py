@@ -68,6 +68,9 @@ def _validate(config: dict[str, Any]) -> None:
         "data.ranges.fixture_intensity",
         "data.ranges.fixture_transition",
         "model.max_lights",
+        "model.fixture_mask_enabled",
+        "model.fixture_mask_stride",
+        "model.fixture_mask_hidden_dim",
         "lighting.fourier_features",
         "lighting.hidden_dim",
         "lighting.fourier_sigma",
@@ -111,6 +114,14 @@ def _validate(config: dict[str, Any]) -> None:
             raise ConfigError(f"data.ranges.{name} must be [minimum, maximum]")
     if int(config["model"]["max_lights"]) < 1:
         raise ConfigError("model.max_lights must be positive")
+    fixture_stride = int(config["model"]["fixture_mask_stride"])
+    if fixture_stride < 1 or int(config["model"]["fixture_mask_hidden_dim"]) < 1:
+        raise ConfigError("fixture mask stride and hidden dimension must be positive")
+    packed_resolution = resolution // 16
+    if bool(config["model"]["fixture_mask_enabled"]) and packed_resolution % fixture_stride:
+        raise ConfigError(
+            "data.resolution / 16 must be divisible by model.fixture_mask_stride"
+        )
     if int(config["lighting"]["fourier_features"]) < 1 or int(config["lighting"]["hidden_dim"]) < 1:
         raise ConfigError("lighting.fourier_features and lighting.hidden_dim must be positive")
     if int(config["lora"]["rank"]) < 1 or int(config["lora"]["alpha"]) < 1:

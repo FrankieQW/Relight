@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-export HOME="${HOME:-/mnt/afs_fangwenqi}"
-PROJECT_ROOT="${PROJECT_ROOT:-/mnt/afs_fangwenqi/new_method}"
-CONDA_ROOT="${CONDA_ROOT:-/mnt/afs_fangwenqi/miniconda3}"
-CONDA_ENV="${CONDA_ENV:-${CONDA_ROOT}/envs/flux-kontext}"
+export HOME="${HOME:-/home/frankie}"
+PROJECT_ROOT="${PROJECT_ROOT:-/home/frankie/programs/Relight}"
+# CONDA_ROOT="${CONDA_ROOT:-/home/frankie/miniconda3}"
+# CONDA_ENV="${CONDA_ENV:-${CONDA_ROOT}/envs/flux-kontext}"
 CONFIG_FILE="${CONFIG_FILE:-${PROJECT_ROOT}/configs/train.yaml}"
-CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3,4,5,6,7}"
-NUM_PROCESSES="${NUM_PROCESSES:-8}"
+CUDA_DEVICES="${CUDA_DEVICES:-0,1}"
+NUM_PROCESSES="${NUM_PROCESSES:-2}"
 MASTER_PORT="${MASTER_PORT:-29621}"
 
-source "${CONDA_ROOT}/etc/profile.d/conda.sh"
-set +u
-conda activate "${CONDA_ENV}"
-set -u
+# source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+# set +u
+# conda activate "${CONDA_ENV}"
+# set -u
 
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
