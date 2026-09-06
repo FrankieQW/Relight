@@ -72,7 +72,7 @@ train:
   checkpointing_steps: 500
   checkpoints_total_limit: 5
   validation_steps: 500
-  validation_batches: 8
+  validation_batches: 64
   validation_seed: 12345
   gradient_checkpointing: false
   guidance_scale: 3.5

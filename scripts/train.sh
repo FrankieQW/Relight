@@ -22,6 +22,7 @@ export TOKENIZERS_PARALLELISM=false
 export OPENCV_IO_ENABLE_OPENEXR=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+unset NCCL_DEBUG_SUBSYS
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 # RTX 6000D systems without GPU P2P can fail in NCCL's shareable cuMem-host
 # path. This keeps the safer shared-memory fallback and remains overridable.
