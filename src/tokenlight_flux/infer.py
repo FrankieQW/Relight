@@ -164,7 +164,12 @@ def load_tokenlight_runtime(
             load_file(str(fixture_state_path), device="cpu"), strict=True
         )
     pipeline.transformer = LightingConditionedTransformer(
-        pipeline.transformer, lighting_encoder, fixture_mask_encoder
+        pipeline.transformer,
+        lighting_encoder,
+        fixture_mask_encoder,
+        lighting_attention_mass=float(
+            lighting_metadata.get("lighting_attention_mass", config["model"].get("lighting_attention_mass", 0.05))
+        ),
     )
     pipeline.text_encoder = None
     pipeline.text_encoder_2 = None

@@ -10,6 +10,126 @@ from torch import nn
 import torch.nn.functional as F
 
 
+class LightingBiasFluxAttnProcessor:
+    """FLUX processor that biases image queries toward lighting keys.
+
+    ``target_mass`` is the aggregate softmax mass lighting keys would receive
+    if all raw attention logits were equal.  The resulting bias is computed
+    from the runtime sequence length, so it adapts to resolution and fixture
+    mask settings.
+    """
+
+    def __init__(self, target_mass: float = 0.05):
+        if not 0.0 < float(target_mass) < 1.0:
+            raise ValueError("lighting attention target_mass must be between 0 and 1")
+        self.target_mass = float(target_mass)
+
+    def __call__(
+        self,
+        attn,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+        tokenlight_lighting_token_count: int = 0,
+        tokenlight_lighting_attention_mass: float | None = None,
+        tokenlight_context_token_count: int = 0,
+    ):
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+        encoder_length = int(encoder_hidden_states.shape[1]) if encoder_hidden_states is not None else int(
+            tokenlight_context_token_count
+        )
+
+        encoder_query = encoder_key = encoder_value = None
+        if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+            encoder_query = attn.add_q_proj(encoder_hidden_states)
+            encoder_key = attn.add_k_proj(encoder_hidden_states)
+            encoder_value = attn.add_v_proj(encoder_hidden_states)
+
+        query = query.unflatten(-1, (-1, attn.head_dim))
+        key = key.unflatten(-1, (-1, attn.head_dim))
+        value = value.unflatten(-1, (-1, attn.head_dim))
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if encoder_hidden_states is not None and encoder_query is not None:
+            encoder_query = encoder_query.unflatten(-1, (-1, attn.head_dim))
+            encoder_key = encoder_key.unflatten(-1, (-1, attn.head_dim))
+            encoder_value = encoder_value.unflatten(-1, (-1, attn.head_dim))
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+        elif encoder_hidden_states is not None:
+            raise RuntimeError("lighting bias processor received unsupported encoder projections")
+
+        if image_rotary_emb is not None:
+            from diffusers.models.embeddings import apply_rotary_emb
+
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        lighting_count = int(tokenlight_lighting_token_count)
+        if not 0 <= lighting_count <= encoder_length < key.shape[1]:
+            raise ValueError("expected lighting tokens within context followed by image tokens")
+        target_mass = self.target_mass if tokenlight_lighting_attention_mass is None else float(
+            tokenlight_lighting_attention_mass
+        )
+        if not 0.0 < target_mass < 1.0:
+            raise ValueError("lighting attention mass must be between 0 and 1")
+
+        if attention_mask is not None and attention_mask.dtype == torch.bool:
+            attention_mask = torch.zeros_like(attention_mask, dtype=query.dtype).masked_fill(
+                ~attention_mask, float("-inf")
+            )
+        additive_mask = attention_mask
+        if lighting_count:
+            non_lighting_count = key.shape[1] - lighting_count
+            bias = math.log(
+                (target_mass / (1.0 - target_mass))
+                * (float(non_lighting_count) / float(lighting_count))
+            )
+            bias_mask = torch.zeros(
+                1, 1, query.shape[1], key.shape[1], device=query.device, dtype=query.dtype
+            )
+            # Only image queries receive the extra lighting-key bias. Context
+            # queries keep the original FLUX attention distribution.
+            bias_mask[:, :, encoder_length:, :lighting_count] = bias
+            additive_mask = bias_mask if additive_mask is None else additive_mask + bias_mask
+
+        output = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attn_mask=additive_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        ).transpose(1, 2)
+        output = output.flatten(2, 3).to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_output, image_output = output.split(
+                [encoder_hidden_states.shape[1], output.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            image_output = attn.to_out[0](image_output.contiguous())
+            image_output = attn.to_out[1](image_output)
+            encoder_output = attn.to_add_out(encoder_output.contiguous())
+            return image_output, encoder_output
+        # Flux single-stream blocks use pre_only=True and intentionally have no
+        # output projection here; their block applies proj_out afterwards.
+        return output
+
+
+def install_lighting_attention_processor(transformer: nn.Module, target_mass: float) -> None:
+    """Install the processor on FLUX double-stream and single-stream blocks."""
+    if not hasattr(transformer, "set_attn_processor"):
+        raise TypeError("transformer does not expose set_attn_processor")
+    transformer.set_attn_processor(LightingBiasFluxAttnProcessor(target_mass))
+
+
 TASK_NAMES = ("ambient_scale", "global_diffuse", "add_light", "in_scene_light")
 TASK_IDS = {name: index for index, name in enumerate(TASK_NAMES)}
 ADD_LIGHT_FIELDS = ("x", "y", "z", "r", "g", "b", "intensity", "softness")
@@ -241,6 +361,7 @@ class LightingConditionedTransformer(nn.Module):
         fixture_mask_encoder: FixtureMaskEncoder | None = None,
         *,
         ddp_trainable_only: bool = False,
+        lighting_attention_mass: float = 0.05,
     ):
         super().__init__()
         if ddp_trainable_only:
@@ -259,6 +380,8 @@ class LightingConditionedTransformer(nn.Module):
         self.lighting_encoder = lighting_encoder
         self.fixture_mask_encoder = fixture_mask_encoder
         self.ddp_trainable_only = bool(ddp_trainable_only)
+        self.lighting_attention_mass = float(lighting_attention_mass)
+        install_lighting_attention_processor(transformer, self.lighting_attention_mass)
 
     @property
     def config(self):
@@ -330,6 +453,9 @@ class LightingConditionedTransformer(nn.Module):
             txt_ids = torch.cat((txt_ids, fixture_ids), dim=-2)
         elif fixture_present is not None and bool(fixture_present.any().item()):
             raise ValueError("checkpoint has no FixtureMaskEncoder for an active fixture mask")
+        attention_kwargs["tokenlight_lighting_token_count"] = int(lighting_tokens.shape[1])
+        attention_kwargs["tokenlight_context_token_count"] = int(encoder_hidden_states.shape[1])
+        attention_kwargs["tokenlight_lighting_attention_mass"] = self.lighting_attention_mass
         return self.transformer(
             *args,
             encoder_hidden_states=encoder_hidden_states,

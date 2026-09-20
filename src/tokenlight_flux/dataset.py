@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +61,23 @@ class TokenLightKontextDataset(Dataset):
         self.intensity_range = _range(config, "light_intensity")
         self.fixture_intensity_range = _range(config, "fixture_intensity")
         self.fixture_transition_range = _range(config, "fixture_transition")
+        composed_root = config["paths"].get("composed_output_root")
+        # Separate exports when sampling settings or the manifest change.
+        provenance = {
+            "format_version": 1,
+            "data": data,
+            "model": config["model"],
+            "dataset_root": str(self.root.resolve()),
+            "scenes": self.scenes,
+        }
+        self.export_id = hashlib.sha256(
+            json.dumps(provenance, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        self.composed_output_root = (
+            Path(composed_root).expanduser() / self.export_id / split if composed_root else None
+        )
+        if self.composed_output_root is not None:
+            self.composed_output_root.mkdir(parents=True, exist_ok=True)
 
     def __len__(self) -> int:
         return len(self.scenes) * self.samples_per_scene
@@ -98,9 +117,24 @@ class TokenLightKontextDataset(Dataset):
         prepared_mask = self._prepare_mask(fixture_mask)
         if fixture_present and float(prepared_mask.max()) <= 0.0:
             raise ValueError(f"in_scene_light fixture mask is empty: {scene.get('id')}")
+        condition_pixels = self._prepare_image(source)
+        target_pixels = self._prepare_image(target)
+        if self.composed_output_root is not None:
+            self._save_composed_sample(
+                index=index,
+                sample_seed=sample_seed,
+                scene_id=str(scene["id"]),
+                task=task,
+                control=control,
+                lighting_values=lighting.values,
+                lighting_known=lighting.known,
+                lighting_valid=lighting.valid,
+                condition_pixels=condition_pixels,
+                target_pixels=target_pixels,
+            )
         return {
-            "condition_pixel_values": torch.from_numpy(self._prepare_image(source)).permute(2, 0, 1),
-            "target_pixel_values": torch.from_numpy(self._prepare_image(target)).permute(2, 0, 1),
+            "condition_pixel_values": torch.from_numpy(condition_pixels).permute(2, 0, 1),
+            "target_pixel_values": torch.from_numpy(target_pixels).permute(2, 0, 1),
             "lighting_values": torch.from_numpy(lighting.values.copy()),
             "lighting_known": torch.from_numpy(lighting.known.copy()),
             "lighting_valid": torch.from_numpy(lighting.valid.copy()),
@@ -113,6 +147,81 @@ class TokenLightKontextDataset(Dataset):
             "sample_index": index,
             "sample_seed": sample_seed,
         }
+
+    def _save_composed_sample(
+        self,
+        *,
+        index: int,
+        sample_seed: int,
+        scene_id: str,
+        task: str,
+        control: dict[str, Any],
+        lighting_values: np.ndarray,
+        lighting_known: np.ndarray,
+        lighting_valid: np.ndarray,
+        condition_pixels: np.ndarray,
+        target_pixels: np.ndarray,
+    ) -> None:
+        """Persist viewable source/target images and exact conditioning metadata."""
+        if self.composed_output_root is None:
+            return
+        sample_dir = self.composed_output_root / f"sample_{index:08d}"
+        metadata_path = sample_dir / "metadata.json"
+        if metadata_path.is_file() and (sample_dir / "condition.png").is_file() and (sample_dir / "target.png").is_file():
+            return
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        for name, pixels in (("condition", condition_pixels), ("target", target_pixels)):
+            temporary = sample_dir / f".{name}.{uuid.uuid4().hex}.png"
+            try:
+                Image.fromarray(self._to_uint8(pixels), mode="RGB").save(temporary)
+                os.replace(temporary, sample_dir / f"{name}.png")
+            finally:
+                temporary.unlink(missing_ok=True)
+        metadata = {
+            "split": self.split,
+            "sample_index": int(index),
+            "sample_seed": int(sample_seed),
+            "scene_id": scene_id,
+            "task": task,
+            "control": control,
+            "lighting_values": [float(value) for value in lighting_values],
+            "lighting_known": [float(value) for value in lighting_known],
+            "lighting_valid": [float(value) for value in lighting_valid],
+            "resolution": int(self.resolution),
+            "exposure": float(self.exposure),
+            "source_image": "condition.png",
+            "target_image": "target.png",
+            "lighting_schema": list(self.schema.names),
+        }
+        temporary_metadata = sample_dir / f".metadata.{uuid.uuid4().hex}.json"
+        try:
+            temporary_metadata.write_text(
+                json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+            )
+            os.replace(temporary_metadata, metadata_path)
+        finally:
+            temporary_metadata.unlink(missing_ok=True)
+        if self.composed_output_root is not None:
+            manifest_path = self.composed_output_root / "export_config.json"
+            if not manifest_path.exists():
+                manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "export_id": self.export_id,
+                            "split": self.split,
+                            "sample_count": len(self),
+                            "ambient_scale_range": list(self.ambient_range),
+                            "config_output_root": str(self.composed_output_root),
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+    @staticmethod
+    def _to_uint8(image: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(np.clip((image + 1.0) * 127.5 + 0.5, 0, 255), dtype=np.uint8)
 
     def _compose(
         self,
@@ -152,7 +261,7 @@ class TokenLightKontextDataset(Dataset):
                 intensity = float(rng.uniform(*self.intensity_range))
                 contribution = np.maximum(self._read_linear(component["path"]) - dark, 0.0)
                 target += contribution * color[None, None, :] * intensity
-                position = component["position"]
+                position = component["camera_position"]
                 lights.append(
                     {
                         "x": float(position[0]),

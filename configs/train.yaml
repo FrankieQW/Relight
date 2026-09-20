@@ -1,11 +1,13 @@
 paths:
   # Complete local Diffusers snapshot. Training never downloads missing files.
-  pretrained_model: /mnt/afs_fangwenqi/models/FLUX.1-Kontext-dev
-  dataset_root: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene
-  train_manifest: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene/manifests/train.jsonl
-  validation_manifest: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene/manifests/validation.jsonl
-  test_manifest: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene/manifests/test.jsonl
-  output_root: /mnt/afs_fangwenqi/new_method/outputs
+  pretrained_model: /home/frankie/models/FLUX.1-Kontext-dev
+  dataset_root: /home/frankie/data/tokenlight_1000obj_960_in_scene
+  train_manifest: /home/frankie/data/tokenlight_1000obj_960_in_scene/manifests/train.jsonl
+  validation_manifest: /home/frankie/data/tokenlight_1000obj_960_in_scene/manifests/validation.jsonl
+  test_manifest: /home/frankie/data/tokenlight_1000obj_960_in_scene/manifests/test.jsonl
+  output_root: /home/frankie/programs/Relight/outputs
+  # Optional cache of generated condition/target PNGs and lighting metadata.
+  composed_output_root: /home/frankie/data/composed_data
   resume_checkpoint: null
 
 data:
@@ -24,10 +26,10 @@ data:
     add_light: 0.25
     in_scene_light: 0.25
   ranges:
-    ambient_scale: [0.0, 1.5]
+    ambient_scale: [0.2, 1.5]
     light_color: [0.2, 1.0]
     light_intensity: [0.1, 1.5]
-    fixture_intensity: [0.0, 1.5]
+    fixture_intensity: [0.2, 1.5]
     fixture_transition: [0.0, 1.0]
 
 model:
@@ -35,6 +37,8 @@ model:
   fixture_mask_enabled: true
   fixture_mask_stride: 4
   fixture_mask_hidden_dim: 128
+  # Aggregate attention mass for lighting keys under equal raw logits.
+  lighting_attention_mass: 0.05
 
 lighting:
   hidden_dim: 512

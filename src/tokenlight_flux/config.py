@@ -124,6 +124,9 @@ def _validate(config: dict[str, Any]) -> None:
         )
     if int(config["lighting"]["fourier_features"]) < 1 or int(config["lighting"]["hidden_dim"]) < 1:
         raise ConfigError("lighting.fourier_features and lighting.hidden_dim must be positive")
+    lighting_attention_mass = float(config["model"].get("lighting_attention_mass", 0.05))
+    if not 0.0 < lighting_attention_mass < 1.0:
+        raise ConfigError("model.lighting_attention_mass must be between 0 and 1")
     if int(config["lora"]["rank"]) < 1 or int(config["lora"]["alpha"]) < 1:
         raise ConfigError("LoRA rank and alpha must be positive")
     if not list(config["lora"]["target_modules"]):

@@ -309,6 +309,7 @@ def main() -> None:
         lighting_encoder,
         fixture_mask_encoder,
         ddp_trainable_only=True,
+        lighting_attention_mass=float(config["model"].get("lighting_attention_mass", 0.05)),
     )
     # Text is not a model condition in this method. Drop the pretrained text
     # components after pipeline construction so they are neither encoded nor moved to GPU.
@@ -410,6 +411,9 @@ def main() -> None:
                         "fixture_mask_hidden_dim": int(
                             config["model"]["fixture_mask_hidden_dim"]
                         ),
+                        "lighting_attention_mass": float(
+                            config["model"].get("lighting_attention_mass", 0.05)
+                        ),
                         "text_conditioning": False,
                     },
                     indent=2,
@@ -455,6 +459,7 @@ def main() -> None:
             "fixture_mask_enabled": fixture_mask_encoder is not None,
             "fixture_mask_stride": int(config["model"]["fixture_mask_stride"]),
             "fixture_mask_hidden_dim": int(config["model"]["fixture_mask_hidden_dim"]),
+            "lighting_attention_mass": float(config["model"].get("lighting_attention_mass", 0.05)),
             "text_conditioning": False,
         }
         if metadata != expected_metadata:
