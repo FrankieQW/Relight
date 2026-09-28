@@ -352,7 +352,13 @@ class FixtureMaskEncoder(nn.Module):
 
 
 class LightingConditionedTransformer(nn.Module):
-    """Use lighting tokens as FLUX context before joint attention."""
+    """Use lighting tokens as FLUX context before joint attention.
+
+    With ``lighting_attention_bias_enabled`` the custom processor adds the
+    lighting logits bias to image queries. When disabled, the transformer keeps
+    its original attention processor and lighting tokens only participate in the
+    regular joint attention.
+    """
 
     def __init__(
         self,
@@ -362,6 +368,7 @@ class LightingConditionedTransformer(nn.Module):
         *,
         ddp_trainable_only: bool = False,
         lighting_attention_mass: float = 0.05,
+        lighting_attention_bias_enabled: bool = True,
     ):
         super().__init__()
         if ddp_trainable_only:
@@ -381,7 +388,9 @@ class LightingConditionedTransformer(nn.Module):
         self.fixture_mask_encoder = fixture_mask_encoder
         self.ddp_trainable_only = bool(ddp_trainable_only)
         self.lighting_attention_mass = float(lighting_attention_mass)
-        install_lighting_attention_processor(transformer, self.lighting_attention_mass)
+        self.lighting_attention_bias_enabled = bool(lighting_attention_bias_enabled)
+        if self.lighting_attention_bias_enabled:
+            install_lighting_attention_processor(transformer, self.lighting_attention_mass)
 
     @property
     def config(self):
@@ -453,9 +462,12 @@ class LightingConditionedTransformer(nn.Module):
             txt_ids = torch.cat((txt_ids, fixture_ids), dim=-2)
         elif fixture_present is not None and bool(fixture_present.any().item()):
             raise ValueError("checkpoint has no FixtureMaskEncoder for an active fixture mask")
-        attention_kwargs["tokenlight_lighting_token_count"] = int(lighting_tokens.shape[1])
-        attention_kwargs["tokenlight_context_token_count"] = int(encoder_hidden_states.shape[1])
-        attention_kwargs["tokenlight_lighting_attention_mass"] = self.lighting_attention_mass
+        if self.lighting_attention_bias_enabled:
+            # Only the bias processor consumes these keys; the default FLUX
+            # processor would reject them as unexpected kwargs.
+            attention_kwargs["tokenlight_lighting_token_count"] = int(lighting_tokens.shape[1])
+            attention_kwargs["tokenlight_context_token_count"] = int(encoder_hidden_states.shape[1])
+            attention_kwargs["tokenlight_lighting_attention_mass"] = self.lighting_attention_mass
         return self.transformer(
             *args,
             encoder_hidden_states=encoder_hidden_states,

@@ -29,11 +29,15 @@ def _range(config: dict[str, Any], name: str) -> tuple[float, float]:
 class TokenLightKontextDataset(Dataset):
     """Build deterministic source/target/lighting triples from TokenLight renders."""
 
-    def __init__(self, config: dict[str, Any], split: str):
+    def __init__(self, config: dict[str, Any], split: str, *, materialize: bool = False):
         if split not in SPLIT_SEED_OFFSETS:
             raise ValueError(f"unsupported split: {split}")
         self.config = config
         self.split = split
+        # Composed PNG/metadata export is an explicit offline pass
+        # (tokenlight_flux.precompose). Training leaves this off so that
+        # sampling never writes to disk.
+        self.materialize = bool(materialize)
         self.root = Path(config["paths"]["dataset_root"]).expanduser()
         manifest_value = config["paths"].get(f"{split}_manifest")
         if not manifest_value:
@@ -74,7 +78,9 @@ class TokenLightKontextDataset(Dataset):
             json.dumps(provenance, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
         self.composed_output_root = (
-            Path(composed_root).expanduser() / self.export_id / split if composed_root else None
+            Path(composed_root).expanduser() / self.export_id / split
+            if composed_root and self.materialize
+            else None
         )
         if self.composed_output_root is not None:
             self.composed_output_root.mkdir(parents=True, exist_ok=True)
@@ -119,7 +125,7 @@ class TokenLightKontextDataset(Dataset):
             raise ValueError(f"in_scene_light fixture mask is empty: {scene.get('id')}")
         condition_pixels = self._prepare_image(source)
         target_pixels = self._prepare_image(target)
-        if self.composed_output_root is not None:
+        if self.materialize and self.composed_output_root is not None:
             self._save_composed_sample(
                 index=index,
                 sample_seed=sample_seed,
@@ -148,6 +154,21 @@ class TokenLightKontextDataset(Dataset):
             "sample_seed": sample_seed,
         }
 
+    def sample_path(self, index: int) -> Path | None:
+        """Directory of one composed sample, or None when export is disabled."""
+        if self.composed_output_root is None:
+            return None
+        return self.composed_output_root / f"sample_{int(index):08d}"
+
+    @staticmethod
+    def sample_is_complete(sample_dir: Path) -> bool:
+        """A composed sample is usable once metadata and both PNGs exist."""
+        return (
+            (sample_dir / "metadata.json").is_file()
+            and (sample_dir / "condition.png").is_file()
+            and (sample_dir / "target.png").is_file()
+        )
+
     def _save_composed_sample(
         self,
         *,
@@ -163,12 +184,12 @@ class TokenLightKontextDataset(Dataset):
         target_pixels: np.ndarray,
     ) -> None:
         """Persist viewable source/target images and exact conditioning metadata."""
-        if self.composed_output_root is None:
+        sample_dir = self.sample_path(index)
+        if sample_dir is None:
             return
-        sample_dir = self.composed_output_root / f"sample_{index:08d}"
+        if self.sample_is_complete(sample_dir):
+            return
         metadata_path = sample_dir / "metadata.json"
-        if metadata_path.is_file() and (sample_dir / "condition.png").is_file() and (sample_dir / "target.png").is_file():
-            return
         sample_dir.mkdir(parents=True, exist_ok=True)
         for name, pixels in (("condition", condition_pixels), ("target", target_pixels)):
             temporary = sample_dir / f".{name}.{uuid.uuid4().hex}.png"

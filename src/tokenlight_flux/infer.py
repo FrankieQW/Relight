@@ -170,6 +170,10 @@ def load_tokenlight_runtime(
         lighting_attention_mass=float(
             lighting_metadata.get("lighting_attention_mass", config["model"].get("lighting_attention_mass", 0.05))
         ),
+        # Checkpoints written before the switch existed trained with the bias on.
+        lighting_attention_bias_enabled=bool(
+            lighting_metadata.get("lighting_attention_bias_enabled", True)
+        ),
     )
     pipeline.text_encoder = None
     pipeline.text_encoder_2 = None

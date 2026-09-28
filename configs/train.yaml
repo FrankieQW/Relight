@@ -39,6 +39,9 @@ model:
   fixture_mask_hidden_dim: 128
   # Aggregate attention mass for lighting keys under equal raw logits.
   lighting_attention_mass: 0.05
+  # Adds beta = log(p/(1-p) * N_non-light/N_light) to image->lighting logits.
+  # Set to false to train without the attention-logits bias.
+  lighting_attention_bias_enabled: true
 
 lighting:
   hidden_dim: 512

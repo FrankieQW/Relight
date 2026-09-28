@@ -35,6 +35,11 @@ def dtype_for(name: str) -> torch.dtype:
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}[name]
 
 
+def attention_bias_enabled(config: dict[str, Any]) -> bool:
+    """Whether the lighting attention-logits bias is active for this run."""
+    return bool(config["model"].get("lighting_attention_bias_enabled", True))
+
+
 def encode_vae(
     vae: torch.nn.Module,
     images: torch.Tensor,
@@ -170,6 +175,11 @@ def print_contract(config: dict[str, Any]) -> None:
                 "lighting_fourier_features": int(config["lighting"]["fourier_features"]),
                 "fixture_mask_enabled": bool(config["model"]["fixture_mask_enabled"]),
                 "fixture_mask_stride": int(config["model"]["fixture_mask_stride"]),
+                "lighting_attention_mass": float(
+                    config["model"].get("lighting_attention_mass", 0.05)
+                ),
+                "lighting_attention_bias_enabled": attention_bias_enabled(config),
+                "composed_output_root": config["paths"].get("composed_output_root"),
                 "network_access": "disabled by local_files_only=True",
             },
             ensure_ascii=False,
@@ -310,6 +320,7 @@ def main() -> None:
         fixture_mask_encoder,
         ddp_trainable_only=True,
         lighting_attention_mass=float(config["model"].get("lighting_attention_mass", 0.05)),
+        lighting_attention_bias_enabled=attention_bias_enabled(config),
     )
     # Text is not a model condition in this method. Drop the pretrained text
     # components after pipeline construction so they are neither encoded nor moved to GPU.
@@ -414,6 +425,7 @@ def main() -> None:
                         "lighting_attention_mass": float(
                             config["model"].get("lighting_attention_mass", 0.05)
                         ),
+                        "lighting_attention_bias_enabled": attention_bias_enabled(config),
                         "text_conditioning": False,
                     },
                     indent=2,
@@ -460,8 +472,12 @@ def main() -> None:
             "fixture_mask_stride": int(config["model"]["fixture_mask_stride"]),
             "fixture_mask_hidden_dim": int(config["model"]["fixture_mask_hidden_dim"]),
             "lighting_attention_mass": float(config["model"].get("lighting_attention_mass", 0.05)),
+            "lighting_attention_bias_enabled": attention_bias_enabled(config),
             "text_conditioning": False,
         }
+        # Checkpoints written before the bias switch existed always trained with
+        # the bias enabled, so a missing key means true.
+        metadata = {"lighting_attention_bias_enabled": True, **metadata}
         if metadata != expected_metadata:
             raise RuntimeError(
                 f"lighting checkpoint metadata mismatch: expected={expected_metadata}, actual={metadata}"
@@ -508,6 +524,13 @@ def main() -> None:
                         parameter.numel()
                         for parameter in transformer.parameters()
                         if not parameter.requires_grad
+                    ),
+                    # Composed samples are exported by the offline
+                    # `python precompose.py` pass; training never writes them.
+                    "composed_export": (
+                        "precompose.py"
+                        if config["paths"].get("composed_output_root")
+                        else "disabled"
                     ),
                 }
             ),

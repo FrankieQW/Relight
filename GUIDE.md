@@ -110,6 +110,32 @@ in_scene_light = ambient + max(fixture_on - dark, 0) * color * intensity * trans
 随后执行 exposure、Reinhard tone mapping、中心裁剪和缩放，输入 VAE 的范围为 `[-1,1]`。
 同一个 `(split, index)` 总是使用同一 seed，因而得到同一 source/target/control。
 
+### Composed 数据：先合成，再训练
+
+训练过程不再写出 composed 数据。需要人工检查或可视化的 source/target 样本由独立脚本
+一次性合成：
+
+```bash
+cd /mnt/afs_fangwenqi/new_method
+python precompose.py --config configs/train.yaml --workers 8
+```
+
+也可以使用包装脚本（自动设置 `PYTHONPATH` 与 OpenEXR 开关）：
+
+```bash
+CONFIG_FILE=configs/train.yaml bash scripts/precompose.sh --split train,validation --workers 8
+```
+
+- `--split` 缺省处理所有存在 manifest 的 split，可重复或用逗号分隔；
+- 脚本幂等：已写出 `metadata.json` + `condition.png` + `target.png` 的样本会跳过，可中断后
+  继续跑，也可以分批多次执行；
+- `--check` 只统计完整性，打印 `expected` / `complete` / `missing` 的 JSON，不完整时以
+  非零退出码结束，适合在正式训练前做门禁。
+
+输出位于 `<paths.composed_output_root>/<export_id>/<split>/sample_XXXXXXXX/`。`export_id`
+由数据段、模型段和 manifest 内容哈希得到，修改 `data` 或 `model` 配置会生成新的导出目录，
+旧目录不会被复用。
+
 ## 5. Lighting token 结构
 
 `model.max_lights=3` 时共有 34 个 scalar tokens：
@@ -178,7 +204,14 @@ pip install -e .
 - gradient accumulation = 4；
 - 8 卡 global batch = `1 × 4 × 8 = 32`；
 - gradient checkpointing 默认关闭（显存不足时可在配置中开启）；
-- 每 500 optimizer steps 保存 checkpoint。
+- 每 500 optimizer steps 保存 checkpoint；
+- attention logits bias 默认开启（`model.lighting_attention_bias_enabled: true`）。
+
+`model.lighting_attention_bias_enabled: false` 时不再安装自定义 attention processor，
+lighting token 只参与普通 joint attention，不施加
+`beta = log(p/(1-p) * N_non-light/N_light)` 的 logits bias。该开关会写入 checkpoint 的
+`lighting_config.json`：旧 checkpoint 缺少该字段时按 `true` 处理，因此可以正常续训；反
+过来用新 checkpoint 配 `false` 续训会被 metadata 校验拒绝，避免在两种模式之间静默切换。
 
 正式配置保持 960。首次部署时可复制一份配置并临时改为 512 完成 smoke；确认显存和训练
 链路后再使用 960。scheduler 会按实际 target token 数计算 dynamic-shifting `mu`。改变分辨率
