@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
+import inspect
 import json
 from pathlib import Path
 from collections.abc import Sequence
+import warnings
 
 import torch
 
@@ -16,6 +19,34 @@ from .lighting import (
     LightingTokenEncoder,
     make_text_free_condition,
 )
+
+
+@lru_cache(maxsize=1)
+def _kontext_call_params() -> frozenset[str]:
+    """Parameter names the installed ``FluxKontextPipeline.__call__`` accepts."""
+    from diffusers import FluxKontextPipeline
+
+    return frozenset(inspect.signature(FluxKontextPipeline.__call__).parameters)
+
+
+def geometry_kwargs(resolution: int) -> dict[str, object]:
+    """Pin generation to the geometry the checkpoint was trained on.
+
+    diffusers defaults ``max_area`` to ``1024**2`` and snaps the condition image
+    to ``PREFERRED_KONTEXT_RESOLUTIONS``. Together those silently turn a 960x960
+    setup into 1024x1024: 4096 instead of 3600 image tokens per stream, a 16x16
+    instead of 15x15 fixture grid and a different dynamic-shift mu. Passing both
+    parameters keeps inference identical to training.
+    """
+    params = _kontext_call_params()
+    return {
+        name: value
+        for name, value in (
+            ("max_area", int(resolution) ** 2),
+            ("_auto_resize", False),
+        )
+        if name in params
+    }
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -230,7 +261,7 @@ def generate_tokenlight_image(
         device=pipeline._execution_device,
         dtype=dtype,
     )
-    return pipeline(
+    result = pipeline(
         image=condition,
         prompt_embeds=context_embeds,
         pooled_prompt_embeds=pooled_context,
@@ -240,7 +271,18 @@ def generate_tokenlight_image(
         guidance_scale=float(guidance_scale),
         generator=generator,
         joint_attention_kwargs=lighting_kwargs,
-    ).images[0]
+        **geometry_kwargs(int(resolution)),
+    )
+    image = result.images[0]
+    size = getattr(image, "size", None)
+    if isinstance(size, tuple) and tuple(size) != (int(resolution), int(resolution)):
+        warnings.warn(
+            f"generated image size {tuple(image.size)} differs from the configured "
+            f"resolution {(int(resolution), int(resolution))}; this diffusers version "
+            "cannot hold the training geometry (needs max_area/_auto_resize support)",
+            stacklevel=2,
+        )
+    return image
 
 
 def main(argv: Sequence[str] | None = None) -> None:

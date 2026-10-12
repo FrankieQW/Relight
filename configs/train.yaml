@@ -27,10 +27,10 @@ data:
     in_scene_light: 0.25
   ranges:
     ambient_scale: [0.2, 1.5]
-    light_color: [0.2, 1.0]
-    light_intensity: [0.1, 1.5]
-    fixture_intensity: [0.2, 1.5]
-    fixture_transition: [0.0, 1.0]
+    light_color: [0.4, 1.0]
+    light_intensity: [0.3, 1.5]
+    fixture_intensity: [0.4, 1.5]
+    fixture_transition: [0.25, 1.0]
 
 model:
   max_lights: 3
