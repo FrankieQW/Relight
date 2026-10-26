@@ -17,6 +17,7 @@ from .lighting import (
     LightingConditionedTransformer,
     LightingSchema,
     LightingTokenEncoder,
+    PackedLighting,
     make_text_free_condition,
 )
 
@@ -234,9 +235,43 @@ def generate_tokenlight_image(
     fixture_present: bool = False,
 ):
     """Generate one controlled image from an already-loaded runtime."""
+    return generate_tokenlight_packed(
+        pipeline,
+        dtype,
+        condition,
+        schema.pack(task, control),
+        resolution=resolution,
+        steps=steps,
+        guidance_scale=guidance_scale,
+        seed=seed,
+        cpu_offload=cpu_offload,
+        fixture_mask=fixture_mask,
+        fixture_present=fixture_present,
+    )
+
+
+def generate_tokenlight_packed(
+    pipeline,
+    dtype: torch.dtype,
+    condition,
+    packed: PackedLighting,
+    *,
+    resolution: int,
+    steps: int,
+    guidance_scale: float,
+    seed: int,
+    cpu_offload: bool = False,
+    fixture_mask: torch.Tensor | None = None,
+    fixture_present: bool = False,
+):
+    """Generate from an already packed lighting vector.
+
+    The vector may mark several tasks worth of fields as known and valid at once.
+    Training always packed exactly one task, so such a combination is an
+    exploratory, out-of-distribution probe rather than a supported mode.
+    """
     generator_device = "cpu" if cpu_offload else "cuda"
     generator = torch.Generator(device=generator_device).manual_seed(int(seed))
-    packed = schema.pack(task, control)
     lighting_kwargs = {
         "tokenlight_values": torch.from_numpy(packed.values)[None],
         "tokenlight_known": torch.from_numpy(packed.known)[None],
