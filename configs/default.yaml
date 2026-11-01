@@ -1,0 +1,193 @@
+project:
+  # Relative to this config file.
+  root: ..
+  schema_version: "1.0"
+  seed: 20260810
+
+paths:
+  object_inventory: data/object/Objaverse.md
+  lvis_annotations: data/object/Objaverse/lvis-annotations.json
+  object_paths: data/object/Objaverse/object-paths.json
+  object_metadata: data/object/metadata/annotations.json
+  object_output: data/object/object.json
+  object_rejects: data/object/object_rejects.jsonl
+
+  scene_root: data/scene
+  scene_output: data/scene/scene.json
+  scene_cache: data/cache/scenes
+  scene_review_jsonl: outputs/reports/scene_group_review.jsonl
+  scene_review_html: outputs/reports/scene_group_review.html
+  scene_review_assets: outputs/reports/scene_group_review_assets
+
+  annotation_output: data/annotation_construction.json
+  annotation_cache: data/annotation_cache.jsonl
+  annotation_review: data/annotation_review.jsonl
+
+  prepared_geometry_output: outputs/manifests/prepared_geometry.json
+  geometry_quarantine: outputs/reports/geometry_quarantine.jsonl
+  render_jobs_output: outputs/manifests/render_jobs.jsonl
+  render_jobs_summary: outputs/manifests/render_jobs.summary.json
+  render_job_rejects: outputs/reports/render_job_rejects.jsonl
+  tokenlight_output: outputs/tokenlight_dataset
+
+object:
+  expected_selected_count: 80
+  expected_unique_category_count: 74
+  strict_expected_counts: true
+  license_allowlist: []
+
+scene:
+  blender_bin: /opt/blender-4.5/blender
+  expected_blender_major_minor: "4.5"
+  allow_blender_version_mismatch: false
+  fbx_glob: "**/*.fbx"
+  workers: 1
+  resume: true
+  id_hash_length: 16
+  aliases_file: configs/category_aliases.yaml
+  overrides_file: configs/scene_overrides.yaml
+  render_review_images: false
+  review_random_fraction: 0.10
+  review_minimum_per_scene: 100
+  review_frequent_minimum: 20
+  low_confidence_threshold: 0.90
+  support_categories:
+    - bar
+    - bench
+    - cabinet
+    - counter
+    - desk
+    - floor
+    - shelf
+    - stool
+    - table
+  non_replaceable_categories:
+    - building
+    - ceiling
+    - floor
+    - road
+    - sidewalk
+    - sky
+    - wall
+    - window
+  frequent_review_categories:
+    - beer_glass
+    - bottle
+    - chair
+    - cutlery
+    - plate
+    - table
+    - water_glass
+    - wine_glass
+
+annotation:
+  base_url: http://127.0.0.1:8000/v1
+  api_key: EMPTY
+  model: Qwen/Qwen3-14B
+  prompt_version: v1
+  concurrency: 16
+  request_timeout_seconds: 120
+  max_retries: 4
+  confidence_review_threshold: 0.80
+  allow_partial: false
+  disable_thinking: true
+
+m4:
+  blender_bin: /opt/blender-4.5/blender
+  object_root_env: OBJECT_ROOT
+  category_dimensions_file: configs/category_dimensions.yaml
+  object_overrides_file: configs/object_overrides.yaml
+  enforce_license_allowlist: true
+  license_policy_version: unconfigured
+  base_scene_license:
+    name: null
+    source_uri: null
+    attribution: null
+    decision: unverified
+
+  relation_priority: [replace, place_on]
+  replacement_fill_ratio: 0.90
+  yaw_degrees: [0, 90, 180, 270]
+  # Formal composition renders always create a camera around the inserted object.
+  # Cameras stored in the source scene are ignored.
+  camera_strategy: generated_target_visible
+  camera_focal_length: 50.0
+  camera_candidate_count: 24
+  camera_azimuth_degrees: [0, 45, 90, 135, 180, 225, 270, 315]
+  camera_elevation_degrees: [15, 25, 35, 45]
+  camera_subject_fill_range: [0.25, 0.60]
+  camera_shift_x_range: [-0.18, 0.18]
+  camera_shift_y_range: [-0.15, 0.15]
+  camera_ndc_x_range: [0.15, 0.85]
+  camera_ndc_y_range: [0.15, 0.85]
+  camera_edge_margin: 0.02
+  camera_target_minimum_visible_pixels: 64
+  # A coarse orbit candidate is locally repaired before it is rejected.  All
+  # offsets are deterministic, so a render job remains reproducible.
+  camera_repair_attempts_per_candidate: 6
+  camera_scored_candidate_limit: 6
+  camera_minimum_visible_ratio: 0.70
+  camera_minimum_clearance: 0.05
+  camera_clearance_subject_ratio: 0.10
+  camera_foreground_grid_size: 12
+  camera_maximum_foreground_fraction: 0.35
+  camera_foreground_depth_margin_ratio: 0.20
+  fixture_categories: [lamp, lantern, light, chandelier, sconce]
+  scene_render_overrides: {}
+  max_render_jobs: null
+
+  render_gpu_ids: [0]
+  render_workers: 1
+  overwrite: false
+  render:
+    resolution: 512
+    engine: CYCLES
+    samples: 64
+    denoise: true
+    persistent_data: false
+    threads_per_worker: auto
+    device: GPU
+    compute_device_type: CUDA
+    require_gpu: true
+    # Stage-2 materialization replaces this with HDRI_ROOT. HDRI files are
+    # selected deterministically per composition from recursive .hdr/.exr files.
+    hdri_root: null
+    ambient_world_strength: 1.0
+    ambient_world_color: [0.18, 0.18, 0.18, 1.0]
+    minimum_visible_pixels: 256
+    place_footprint_limit: 1.0
+    # AABB is broad-phase only; BVH triangle overlap decides real collisions.
+    collision_aabb_tolerance: 0.002
+    collision_bvh_epsilon: 0.0
+    collision_shrink_enabled: true
+    collision_shrink_factor: 0.90
+    collision_min_scale_ratio: 0.60
+    collision_max_attempts: 6
+    point_lights_per_scene: 16
+    point_energy: 500.0
+    point_position_ranges:
+      x: [-1.2, 1.2]
+      y: [-0.6, 1.2]
+      z: [0.15, 1.8]
+    point_radius_range: [0.03, 0.25]
+    diffuse_sizes: [0.05, 0.2, 0.4, 0.7, 1.0, 1.5]
+    diffuse_position: [0.0, 0.3, 1.3]
+    fixture_energy: 300.0
+    fixture_light_radius: 0.12
+    fallback_emission_strength: 4.0
+    require_verified_license: true
+  fixture:
+    minimum_visible_pixels: 64
+    maximum_screen_fraction: 0.05
+    fallback_position_mode: subject_relative
+    fallback_candidates: 24
+    fallback_fixture_size_ratio: 0.12
+    fallback_fixture_size_min: 0.01
+    fallback_fixture_size_max: 0.08
+    # Values are multiplied by the inserted object's maximum world dimension.
+    # Target-relative world-space offsets.  The fixture is fixed before the
+    # final camera search, rather than being regenerated in camera space.
+    fallback_position_ranges:
+      x: [-1.5, 1.5]
+      y: [-1.5, 1.5]
+      z: [0.8, 2.0]

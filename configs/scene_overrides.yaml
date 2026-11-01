@@ -1,0 +1,6 @@
+# Optional M2 corrections. Regenerate scene.json after editing.
+rename_categories: {}
+entity_flags: {}
+merge_entities: []
+split_entities: []
+

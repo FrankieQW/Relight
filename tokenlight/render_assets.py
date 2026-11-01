@@ -451,6 +451,361 @@ def configure_render(config: dict) -> None:
                 scene.cycles.device = "CPU"
 
 
+PASS_SOCKETS = {
+    "albedo": "Diffuse Color",
+    "normal_world": "Normal",
+    "direct": "Diffuse Direct",
+    "indirect": "Diffuse Indirect",
+    "color": "Diffuse Color",
+}
+
+
+def configure_passes(config: dict) -> None:
+    """Enable Cycles passes and build the compositor outputs that write them.
+
+    Only ``CompositorNodeOutputFile`` is used, so the graph stays compatible
+    across Blender versions: every derived quantity (irradiance, camera-space
+    normals) is computed in Python from the raw passes instead of with
+    compositor maths.
+    """
+    scene = bpy.context.scene
+    view_layer = scene.view_layers[0]
+    view_layer.use_pass_diffuse_color = True
+    view_layer.use_pass_diffuse_direct = True
+    view_layer.use_pass_diffuse_indirect = True
+    view_layer.use_pass_normal = True
+    scene.use_nodes = True
+    tree = scene.node_tree
+    for node in list(tree.nodes):
+        if node.name.startswith("LC_PASS_"):
+            tree.nodes.remove(node)
+    layers = next((node for node in tree.nodes if node.type == "R_LAYERS"), None)
+    if layers is None:
+        layers = tree.nodes.new("CompositorNodeRLayers")
+    for key, socket in PASS_SOCKETS.items():
+        output = tree.nodes.new("CompositorNodeOutputFile")
+        output.name = f"LC_PASS_{key}"
+        output.base_path = str(Path(bpy.context.blend_data.filepath or ".").parent)
+        output.format.file_format = "OPEN_EXR"
+        output.format.color_depth = "16"
+        output.format.color_mode = "RGB"
+        output.file_slots[0].path = f"{key}_"
+        output.mute = True
+        tree.links.new(layers.outputs[socket], output.inputs[0])
+
+
+def _pass_outputs():
+    scene = bpy.context.scene
+    if not getattr(scene, "use_nodes", False) or scene.node_tree is None:
+        return []
+    return [
+        node
+        for node in scene.node_tree.nodes
+        if node.name.startswith("LC_PASS_") and node.type == "OUTPUT_FILE"
+    ]
+
+
+def _mute_all_passes() -> None:
+    for node in _pass_outputs():
+        node.mute = True
+
+
+def render_with_passes(
+    passes_dir: Path,
+    keys,
+    *,
+    combined_path: Path | None = None,
+    samples: int | None = None,
+    film_transparent: bool | None = None,
+) -> dict[str, Path]:
+    """Render one still and return the requested raw Cycles passes.
+
+    ``combined_path`` writes the normal combined image as well; when it is
+    ``None`` only the passes reach disk.  ``keys`` must be a subset of
+    :data:`PASS_SOCKETS`.
+    """
+    scene = bpy.context.scene
+    outputs = {node.name[len("LC_PASS_") :]: node for node in _pass_outputs()}
+    missing = [key for key in keys if key not in outputs]
+    if missing:
+        raise RuntimeError(
+            f"pass outputs are not configured (missing {missing}); call configure_passes first"
+        )
+    passes_dir.mkdir(parents=True, exist_ok=True)
+    if combined_path is not None:
+        combined_path.parent.mkdir(parents=True, exist_ok=True)
+    saved = {
+        "filepath": scene.render.filepath,
+        "film_transparent": scene.render.film_transparent,
+        "samples": scene.cycles.samples if scene.render.engine == "CYCLES" else None,
+        "denoising": scene.cycles.use_denoising if scene.render.engine == "CYCLES" else None,
+    }
+    try:
+        if samples is not None and scene.render.engine == "CYCLES":
+            scene.cycles.samples = int(samples)
+        if film_transparent is not None:
+            scene.render.film_transparent = bool(film_transparent)
+        active = set(keys)
+        for key, node in outputs.items():
+            node.mute = key not in active
+            node.base_path = str(passes_dir)
+            node.file_slots[0].path = f"{key}_"
+        scene.render.filepath = str(
+            combined_path if combined_path is not None else passes_dir / "_unused.exr"
+        )
+        bpy.ops.render.render(write_still=combined_path is not None)
+        result: dict[str, Path] = {}
+        for key in keys:
+            matches = sorted(passes_dir.glob(f"{key}_*.exr"))
+            if not matches:
+                raise RuntimeError(f"pass {key!r} was not written to {passes_dir}")
+            target = passes_dir / f"{key}.exr"
+            if target.exists():
+                target.unlink()
+            matches[-1].rename(target)
+            for leftover in matches[:-1]:
+                leftover.unlink(missing_ok=True)
+            result[key] = target
+        return result
+    finally:
+        scene.render.filepath = saved["filepath"]
+        scene.render.film_transparent = saved["film_transparent"]
+        if scene.render.engine == "CYCLES":
+            if saved["samples"] is not None:
+                scene.cycles.samples = saved["samples"]
+            if saved["denoising"] is not None:
+                scene.cycles.use_denoising = saved["denoising"]
+        _mute_all_passes()
+
+
+_INTRINSIC_MODULE = None
+
+
+def _load_intrinsic_module():
+    """Load ``datacompose/intrinsic.py`` without importing the package.
+
+    The Blender-side renderer is executed by path, so ``datacompose`` is not on
+    ``sys.path``.  Loading the tested pure-NumPy helpers by file keeps a single
+    implementation of the irradiance maths.
+    """
+    global _INTRINSIC_MODULE
+    if _INTRINSIC_MODULE is None:
+        import importlib.util as _importlib_util
+
+        module_path = Path(__file__).resolve().parents[1] / "intrinsic.py"
+        spec = _importlib_util.spec_from_file_location(
+            "datacompose_intrinsic_render_assets", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot load intrinsic helpers: {module_path}")
+        module = _importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _INTRINSIC_MODULE = module
+    return _INTRINSIC_MODULE
+
+
+def render_pass_reference(
+    directory: Path,
+    config: dict,
+    *,
+    save: tuple[str, ...] = ("albedo", "normal_world"),
+) -> dict[str, Path]:
+    """Render the unlit reference passes (albedo + world normals) once.
+
+    ``pass_samples`` (default 1) and ``film_transparent`` keep this reference
+    independent of the lighting render so ``albedo`` equals Cycles' Diffuse
+    Color and empty background pixels stay at zero for ``valid_mask``.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    keys = [key for key in save if key in PASS_SOCKETS]
+    return render_with_passes(
+        directory,
+        keys,
+        samples=int(config.get("pass_samples", 1)),
+        film_transparent=True,
+    )
+
+
+def read_linear_image(path: Path):
+    """Load an EXR as a top-down float32 HxWx3 array (Blender stores rows bottom-up)."""
+    import numpy as np
+
+    image = bpy.data.images.load(str(path), check_existing=False)
+    try:
+        image.colorspace_settings.name = "Non-Color"
+        width, height = image.size
+        if width == 0 or height == 0:
+            raise ValueError(f"cannot read image size from {path}")
+        buffer = np.empty(width * height * 4, dtype=np.float32)
+        image.pixels.foreach_get(buffer)
+        pixels = buffer.reshape(height, width, 4)
+        return np.flipud(pixels)[:, :, :3].copy()
+    finally:
+        bpy.data.images.remove(image)
+
+
+def save_linear_image(path: Path, array) -> None:
+    """Write a top-down float32 HxWx3 array as a 16-bit linear EXR."""
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = np.asarray(array, dtype=np.float32)
+    if data.ndim != 3 or data.shape[2] != 3:
+        raise ValueError(f"expected HxWx3 image, got {data.shape}")
+    height, width = data.shape[:2]
+    rgba = np.ones((height, width, 4), dtype=np.float32)
+    rgba[:, :, :3] = data
+    image = bpy.data.images.new(path.stem, width=width, height=height, alpha=False, float_buffer=True)
+    try:
+        image.colorspace_settings.name = "Non-Color"
+        image.pixels.foreach_set(np.flipud(rgba).ravel())
+        image.file_format = "OPEN_EXR"
+        image.filepath_raw = str(path)
+        image.save()
+    finally:
+        bpy.data.images.remove(image)
+
+
+def save_mask_image(path: Path, mask) -> None:
+    """Write a boolean/sampled mask as an 8-bit grayscale PNG."""
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    values = np.asarray(mask).astype(np.float32)
+    if values.ndim != 2:
+        raise ValueError(f"expected HxW mask, got {values.shape}")
+    height, width = values.shape
+    rgba = np.ones((height, width, 4), dtype=np.float32)
+    rgba[:, :, :3] = values[:, :, None]
+    image = bpy.data.images.new(path.stem, width=width, height=height, alpha=False)
+    try:
+        image.colorspace_settings.name = "Non-Color"
+        image.pixels.foreach_set(np.flipud(rgba).ravel())
+        image.file_format = "PNG"
+        image.filepath_raw = str(path)
+        image.save()
+    finally:
+        bpy.data.images.remove(image)
+
+
+def _reachable_image_node(principled):
+    """Return the first Image Texture node feeding ``principled`` Base Color.
+
+    Walks upstream through node links so a Base Color driven by a small node
+    group still resolves to its image.  Returns ``None`` when the chain does not
+    end at an image (e.g. a pure colour or an opaque node group).
+    """
+    base = principled.inputs.get("Base Color") if principled is not None else None
+    if base is None or not base.is_linked:
+        return None
+    seen = set()
+    stack = [link.from_node for link in base.links]
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if node.type == "TEX_IMAGE":
+            return node
+        for socket in getattr(node, "inputs", []):
+            for link in socket.links:
+                stack.append(link.from_node)
+    return None
+
+
+def _image_state(image) -> tuple[bool, list[int]]:
+    """Return ``(exists, [width, height])`` for a Blender image datablock."""
+    path = bpy.path.abspath(image.filepath) if image.filepath else ""
+    exists = bool(image.packed_file) or (bool(path) and Path(path).is_file())
+    return exists, [int(image.size[0]), int(image.size[1])]
+
+
+def audit_materials() -> dict:
+    """Summarise whether materials actually link their textures.
+
+    A material counts as *textured* when its node tree contains an Image Texture
+    node.  ``base_color_linked_ratio`` is computed over that subset only, so
+    deliberately flat materials never look like failures.  ``base_color_linked``
+    additionally requires the Base Color image to exist on disk with a non-zero
+    size, treating a missing/empty placeholder as "not connected".
+    """
+    rows: list[dict] = []
+    textured = 0
+    base_linked = 0
+    linked_without_image = 0
+    unknown = 0
+    missing: list[dict] = []
+    for material in bpy.data.materials:
+        entry: dict = {"material": material.name, "has_nodes": bool(material.use_nodes)}
+        if not material.use_nodes or material.node_tree is None:
+            rows.append(entry)
+            continue
+        nodes = material.node_tree.nodes
+        image_nodes = [node for node in nodes if node.type == "TEX_IMAGE"]
+        principled = next((node for node in nodes if node.type == "BSDF_PRINCIPLED"), None)
+        for node in image_nodes:
+            image = node.image
+            if image is None:
+                continue
+            exists, _size = _image_state(image)
+            if not exists:
+                path = bpy.path.abspath(image.filepath) if image.filepath else ""
+                missing.append({"material": material.name, "path": path})
+        base_node = _reachable_image_node(principled)
+        base_image = base_node.image if base_node is not None else None
+        image_exists = None
+        image_size = None
+        linked = False
+        if base_image is not None:
+            image_exists, image_size = _image_state(base_image)
+            linked = bool(image_exists and image_size[0] > 0 and image_size[1] > 0)
+            if not linked:
+                path = bpy.path.abspath(base_image.filepath) if base_image.filepath else ""
+                missing.append({"material": material.name, "path": path})
+        elif principled is not None and principled.inputs.get("Base Color") is not None and principled.inputs["Base Color"].is_linked:
+            # Base Color is driven by something we cannot resolve to an image.
+            unknown += 1
+        if image_nodes:
+            textured += 1
+            if linked:
+                base_linked += 1
+        elif linked:
+            linked_without_image += 1
+
+        def input_linked(name: str) -> bool:
+            socket = principled.inputs.get(name) if principled is not None else None
+            return bool(socket is not None and socket.is_linked)
+
+        entry.update(
+            {
+                "principled": principled is not None,
+                "base_color_linked": linked,
+                "base_color_image": base_image.name if base_image is not None else None,
+                "image_exists": image_exists,
+                "image_size": image_size,
+                "textured": bool(image_nodes),
+                "normal_linked": input_linked("Normal"),
+                "metallic_linked": input_linked("Metallic"),
+                "roughness_linked": input_linked("Roughness"),
+            }
+        )
+        rows.append(entry)
+    denominator = max(textured - unknown, 0)
+    return {
+        "materials": len(bpy.data.materials),
+        "textured": textured,
+        "textured_materials": textured,
+        "base_color_linked": base_linked,
+        "base_color_linked_ratio": (base_linked / denominator) if denominator else None,
+        "unknown_materials": unknown,
+        "linked_without_image": linked_without_image,
+        "missing_image_files": len(missing),
+        "missing_examples": [item["path"] for item in missing[:10]],
+        "rows": rows,
+    }
+
+
 def add_light(name: str, kind: str, location, energy: float, radius: float):
     data = bpy.data.lights.new(name, kind)
     data.energy = energy
@@ -519,10 +874,56 @@ def remove_light(light) -> None:
         bpy.data.lights.remove(data)
 
 
-def render_exr(path: Path) -> None:
+def render_exr(
+    path: Path,
+    pass_dir: Path | None = None,
+    save: tuple[str, ...] = (),
+    *,
+    name: str | None = None,
+    eps: float = 1e-3,
+) -> dict[str, Path]:
+    """Render the combined image to ``path`` and optionally persist derived passes.
+
+    When ``pass_dir`` is set and ``save`` is non-empty, the *same* Cycles render
+    also writes the raw diffuse passes, so ``irradiance`` is derived without a
+    second render.  Raw passes are deleted immediately; only the derived
+    products listed in ``save`` survive (``irradiance`` ->
+    ``<pass_dir>/irradiance/<name>.exr``).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    bpy.context.scene.render.filepath = str(path)
-    bpy.ops.render.render(write_still=True)
+    if pass_dir is None or not save:
+        _mute_all_passes()
+        bpy.context.scene.render.filepath = str(path)
+        bpy.ops.render.render(write_still=True)
+        return {}
+    pass_dir = Path(pass_dir)
+    label = name or path.stem
+    raw_dir = pass_dir / "_raw" / label
+    raw = render_with_passes(raw_dir, ["color", "direct", "indirect"], combined_path=path)
+    saved: dict[str, Path] = {}
+    try:
+        if "irradiance" in save:
+            intrinsic = _load_intrinsic_module()
+            albedo = read_linear_image(raw["color"])
+            direct = read_linear_image(raw["direct"])
+            indirect = read_linear_image(raw["indirect"])
+            irradiance, _valid = intrinsic.derive_irradiance(
+                albedo, direct, indirect, eps=float(eps)
+            )
+            target = pass_dir / "irradiance" / f"{label}.exr"
+            save_linear_image(target, irradiance)
+            saved["irradiance"] = target
+    finally:
+        for leftover in raw_dir.glob("*.exr"):
+            leftover.unlink()
+        if raw_dir.is_dir():
+            for child in raw_dir.iterdir():
+                child.unlink()
+            raw_dir.rmdir()
+        raw_parent = raw_dir.parent
+        if raw_parent.is_dir() and not any(raw_parent.iterdir()):
+            raw_parent.rmdir()
+    return saved
 
 
 def render_fixture_mask(path: Path, fixture, material, background, mask_samples: int) -> None:

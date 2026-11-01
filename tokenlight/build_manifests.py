@@ -115,6 +115,7 @@ def main() -> None:
             split: sha256_file(output_root / "manifests" / f"{split}.jsonl")
             for split in split_rows
         },
+        "intrinsic_passes": intrinsic_passes_payload(rows, render),
         "camera_position": {
             "axes": coordinates.CAMERA_AXES,
             "depth": "signed_distance_along_camera_forward_axis",
@@ -213,6 +214,33 @@ def fixture_source_counts(rows: list[dict]) -> dict[str, int]:
             if source in counts:
                 counts[source] += 1
     return counts
+
+
+def intrinsic_passes_payload(rows: list[dict], render: dict) -> dict:
+    """Summarise intrinsic pass availability for ``dataset_release.json``.
+
+    ``enabled``/``rows_with_passes`` are derived from the shipped metadata so the
+    release stays truthful even if only some jobs were re-rendered with passes.
+    """
+    render_passes = (render or {}).get("passes") or {}
+    definitions: dict = {}
+    for row in rows:
+        block = row.get("passes")
+        if isinstance(block, dict) and isinstance(block.get("definition"), dict):
+            definitions = dict(block["definition"])
+            break
+    return {
+        "enabled": any(isinstance(row.get("passes"), dict) for row in rows),
+        "rows_with_passes": sum(1 for row in rows if isinstance(row.get("passes"), dict)),
+        "definitions": definitions,
+        "quality_thresholds": {
+            "min_base_color_linked_ratio": float(
+                render_passes.get("min_base_color_linked_ratio", 0.9)
+            ),
+            "max_magenta_ratio": float(render_passes.get("max_magenta_ratio", 1e-4)),
+            "min_textured_pixel_ratio": 0.02,
+        },
+    }
 
 
 def sha256_file(path: Path) -> str:

@@ -17,6 +17,7 @@ from .scene_extract import prepare_scenes
 
 
 LOGGER = logging.getLogger("datacompose")
+DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "default.yaml"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -148,7 +149,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _common_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument(
         "--log-level",
         default="INFO",

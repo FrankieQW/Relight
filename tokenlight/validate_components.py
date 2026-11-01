@@ -13,7 +13,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from datacompose import coordinates  # noqa: E402
+from datacompose import coordinates, intrinsic  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,7 +47,22 @@ def main() -> None:
         "in_scene_lights": 0,
         "scene_native_fixtures": 0,
         "procedural_fallback_fixtures": 0,
+        "pass_sets": 0,
+        "pass_warnings": [],
         "task_eligible_scenes": {task: 0 for task in data_config["tasks"]},
+    }
+    passes_options = data_config.get("passes") or {}
+    pass_options = {
+        "require_textures": bool(
+            passes_options.get("require_textures", data_config.get("require_textures", False))
+        ),
+        "min_base_color_linked_ratio": float(
+            passes_options.get("min_base_color_linked_ratio", 0.9)
+        ),
+        "max_magenta_ratio": float(passes_options.get("max_magenta_ratio", 1e-4)),
+        "min_textured_pixel_ratio": float(
+            passes_options.get("min_textured_pixel_ratio", 0.02)
+        ),
     }
     manifest_rows: list[tuple[str, list[dict[str, Any]]]] = []
     for split, manifest_value in manifests.items():
@@ -78,7 +93,13 @@ def main() -> None:
                             }
                         )
                 try:
-                    validate_scene(root, row, counts, require_composition=require_composition)
+                    validate_scene(
+                        root,
+                        row,
+                        counts,
+                        require_composition=require_composition,
+                        pass_options=pass_options,
+                    )
                 except Exception as error:
                     errors.append({"scene_id": row.get("id"), "split": split, "error": type(error).__name__, "detail": str(error)})
                 progress.update(1)
@@ -107,6 +128,7 @@ def validate_scene(
     counts: dict[str, Any],
     *,
     require_composition: bool,
+    pass_options: dict[str, Any] | None = None,
 ) -> None:
     for key in ("id", "asset", "ambient", "dark", "point_lights", "diffuse", "camera", "canonical"):
         if key not in scene:
@@ -166,6 +188,119 @@ def validate_scene(
     }
     for task in counts["task_eligible_scenes"]:
         counts["task_eligible_scenes"][task] += int(supported.get(task, False))
+    if scene.get("passes") is not None:
+        validate_passes(root, scene, ambient, counts, **(pass_options or {}))
+
+
+def validate_passes(
+    root: Path,
+    scene: dict[str, Any],
+    ambient: np.ndarray,
+    counts: dict[str, Any],
+    *,
+    require_textures: bool = False,
+    min_base_color_linked_ratio: float = 0.9,
+    max_magenta_ratio: float = 1e-4,
+    min_textured_pixel_ratio: float = 0.02,
+) -> None:
+    """Validate the intrinsic pass set (albedo / normals / irradiance / mask).
+
+    Structural problems always raise.  Quality problems raise only when
+    ``require_textures`` is set; otherwise they are collected in
+    ``counts["pass_warnings"]`` so a dataset can still be inspected.
+    """
+    passes = scene["passes"]
+    if not isinstance(passes, dict):
+        raise ValueError("passes 必须是 mapping")
+    for key in ("albedo", "normal_camera", "valid_mask"):
+        if not passes.get(key):
+            raise ValueError(f"passes 缺少字段 {key}")
+    definition = passes.get("definition") or {}
+    eps = float(definition.get("eps", 1e-3))
+    if not np.isfinite(eps) or eps <= 0:
+        raise ValueError("passes.definition.eps 非法")
+
+    albedo = read_linear(resolve(root, passes["albedo"]))
+    require_shape(albedo, ambient, passes["albedo"])
+    if not np.isfinite(albedo).all():
+        raise ValueError("albedo 含 NaN/Inf")
+    if float(albedo.min()) < -1e-3 or float(albedo.max()) > 1.0 + 1e-3:
+        raise ValueError(
+            f"albedo 超出 [-1e-3, 1+1e-3]: [{float(albedo.min()):.4g}, {float(albedo.max()):.4g}]"
+        )
+
+    normal = read_linear(resolve(root, passes["normal_camera"]))
+    require_shape(normal, ambient, passes["normal_camera"])
+    valid = read_mask(resolve(root, passes["valid_mask"]))
+    if valid.shape != ambient.shape[:2]:
+        raise ValueError(f"valid_mask shape 不一致: {valid.shape} vs {ambient.shape[:2]}")
+    valid_bool = valid.astype(bool)
+    if not valid_bool.any():
+        raise ValueError("valid_mask 全零")
+    lengths = np.linalg.norm(normal[valid_bool], axis=1)
+    if lengths.size and np.any(np.abs(lengths - 1.0) > 1e-3):
+        raise ValueError("valid 像素上 normal 不是单位向量")
+
+    irradiance_files = passes.get("irradiance") or {}
+    if not isinstance(irradiance_files, dict) or not irradiance_files:
+        raise ValueError("passes.irradiance 不能为空")
+    for label, relative in irradiance_files.items():
+        irradiance = read_linear(resolve(root, relative))
+        require_shape(irradiance, ambient, relative)
+        if not np.isfinite(irradiance).all():
+            raise ValueError(f"irradiance {label} 含 NaN/Inf")
+        if float(irradiance.min()) < -1e-6:
+            raise ValueError(f"irradiance {label} 出现负值")
+
+    counts.setdefault("pass_sets", 0)
+    warnings = counts.setdefault("pass_warnings", [])
+    scene_id = scene.get("id")
+    measured = intrinsic.albedo_quality(albedo)
+    if float(measured["magenta_ratio"]) > float(max_magenta_ratio):
+        message = (
+            f"{scene_id}: albedo magenta_ratio={measured['magenta_ratio']:.3g} "
+            f"> {max_magenta_ratio:.3g}"
+        )
+        if require_textures:
+            raise ValueError(message)
+        warnings.append(message)
+
+    stored = passes.get("quality") or {}
+    textured_ratio = float(
+        stored.get("textured_pixel_ratio", measured["textured_pixel_ratio"])
+    )
+    if textured_ratio < float(min_textured_pixel_ratio):
+        message = (
+            f"{scene_id}: textured_pixel_ratio={textured_ratio:.3g} "
+            f"< {min_textured_pixel_ratio:.3g}"
+        )
+        if require_textures:
+            raise ValueError(message)
+        warnings.append(message)
+
+    audit_relative = passes.get("material_audit")
+    if audit_relative:
+        audit = read_json(resolve(root, audit_relative))
+        stored_ratio = stored.get("base_color_linked_ratio")
+        audit_ratio = audit.get("base_color_linked_ratio")
+        if (
+            stored_ratio is not None
+            and audit_ratio is not None
+            and abs(float(stored_ratio) - float(audit_ratio)) > 1e-6
+        ):
+            raise ValueError(
+                "passes.quality.base_color_linked_ratio 与 material_audit.json 不一致"
+            )
+        for problem in intrinsic.evaluate_material_audit(
+            audit,
+            min_base_color_linked_ratio=min_base_color_linked_ratio,
+            require_textures=True,
+        ):
+            message = f"{scene_id}: {problem}"
+            if require_textures:
+                raise ValueError(message)
+            warnings.append(message)
+    counts["pass_sets"] += 1
 
 
 def validate_composition_contract(scene: dict[str, Any]) -> None:
@@ -394,14 +529,24 @@ def require_shape(image: np.ndarray, reference: np.ndarray, name: str) -> None:
 def read_mask(path: Path) -> np.ndarray:
     if not path.is_file():
         raise FileNotFoundError(path)
-    import cv2
+    if path.suffix.lower() == ".npy":
+        mask = np.load(path)
+    else:
+        import cv2
 
-    mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if mask is None:
-        raise ValueError(f"OpenCV 无法读取 fixture mask: {path}")
+        mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise ValueError(f"OpenCV 无法读取 fixture mask: {path}")
     if mask.ndim == 3:
         mask = mask[..., 0]
     return mask
+
+
+def read_json(path: Path) -> dict:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with path.open("r", encoding="utf-8-sig") as handle:
+        return json.load(handle)
 
 
 def resolve(root: Path, value: str) -> Path:

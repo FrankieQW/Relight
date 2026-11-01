@@ -1,14 +1,13 @@
 # datacompose 数据合成指南
 
-本目录是 LightConstruction 的**数据合成**代码集合：把 Objaverse 单物体资产放进或替换到 Bistro 场景里，
-渲染出 TokenLight 需要的线性光照分量与 manifest。坐标约定与仓库根目录 `transfer.py` 完全一致，并在此
-基础上补齐了**相机坐标系下的图像平面坐标与深度**，因此下游既可以读三维相机向量，也可以读二维图像平面
-位置加深度的组合。
+本目录是 LightConstruction 的**数据合成**代码集合（可独立复制运行的 compose 项目）：把 Objaverse 单物体
+资产放进或替换到 Bistro 场景里，渲染出 TokenLight 需要的线性光照分量与 manifest。坐标约定与本目录内
+`transfer.py` 完全一致，并在此基础上补齐了**相机坐标系下的图像平面坐标与深度**。
 
-- 参考实现：根目录 `transfer.py`（保留原样，作为坐标约定的权威脚本）。
+- 参考实现：本目录 `transfer.py`（纯标准库，作为坐标约定的权威脚本）。
 - 模块化实现：`datacompose/coordinates.py`（本包内，供流水线和测试直接导入，并多写 `image_plane`）。
-- 一致性保证：`tests/test_coordinates.py` 用同一份 manifest 同时跑两套实现，断言 `camera_position`
-  逐位相等；GUID 中的公式与这两个文件同源。
+- 一致性保证：`datacompose/tests/test_coordinates.py` 用同一份 manifest 同时跑两套实现，断言
+  `camera_position` 逐位相等。
 
 ---
 
@@ -17,11 +16,13 @@
 ```text
 datacompose/
 ├── GUID.md                     本文档
+├── README.md                   独立项目快速上手
 ├── __init__.py                 __version__
 ├── __main__.py                 python -m datacompose
 ├── cli.py                      M1–M4 统一入口
 ├── config.py                   YAML 配置与项目根解析
 ├── coordinates.py              相机坐标 / 图像平面 / 深度（transfer.py 的模块版 + 扩展）
+├── intrinsic.py                物理表征通道推导（albedo / irradiance / normal，纯 NumPy）
 ├── io_utils.py                 原子写、digest、JSONL
 ├── schemas.py                  Pydantic 数据协议
 ├── scene_semantics.py          类别归一化与别名
@@ -32,6 +33,13 @@ datacompose/
 ├── render_jobs.py              build-render-jobs
 ├── render_compositions.py      render（调度 blender/render_composition.py）
 ├── render_recovery.py          渲染 partial 的清理与恢复
+├── transfer.py                 坐标约定权威参考实现（纯标准库）
+├── configs/
+│   ├── default.yaml            项目配置（project.root=.. 指向本目录）
+│   ├── category_aliases.yaml
+│   ├── category_dimensions.yaml
+│   ├── object_overrides.yaml
+│   └── scene_overrides.yaml
 ├── blender/
 │   ├── entry.py                FBX 导入、归一化、稳定 ID、scene fragment
 │   └── render_composition.py   组合放置/替换、相机与灯光选择、分量渲染、metadata
@@ -39,15 +47,21 @@ datacompose/
 │   ├── render_assets.py        Blender 侧渲染工具（供 render_composition.py 动态加载）
 │   ├── build_manifests.py      components → train/validation/test.jsonl（含 split 隔离）
 │   └── validate_components.py  分量、组合契约与坐标约定校验
-└── stage2/
-    ├── config.py               stage2 配置物化、冻结标注校验、smoke 配置生成
-    ├── run_stage2.sh           M1–M5 编排（data / smoke / train / eval / tests）
-    └── stage2.env.example      运维环境变量模板
+└── tests/
+    ├── test_coordinates.py
+    ├── test_intrinsic_passes.py
+    ├── test_manifest_camera.py
+    ├── test_composition_validator.py
+    ├── test_geometry_prepare.py
+    ├── test_render_compositions.py
+    ├── test_render_jobs.py
+    ├── test_render_recovery.py
+    └── blender_composition_focus.py
 ```
 
-`Lumina-T2X/lumina_next_t2i/`、`Lumina-T2X/tools/tokenlight_data/inspect_dataset.py`、`flux/` 与
-`new_method/` 属于**训练与消费侧**，不在本目录内。`inspect_dataset.py` 需要导入
-`Lumina-T2X/lumina_next_t2i/tokenlight`，因此仍留在原处，由 `run_stage2.sh` 以该目录为工作目录调用。
+本目录是**独立可复制的 compose 项目**：只依赖自身代码与本目录下的 `configs/`、`transfer.py`，
+不引用上级仓库的 `src/`、`scripts/`、`Lumina-T2X/`。数据（Objaverse 资产、Bistro 场景）与训练侧
+由外部提供，通过 `--config` 的数据路径或环境变量接入；原 `stage2`（训练编排）已移出本项目。
 
 ---
 
@@ -285,7 +299,7 @@ manifest 或外部工具自行恢复。`focal_length` 与 `sensor_width` 只是 
 ```
 
 `validate_components.py` 会检查 `canonical.position_axes` 是否等于约定值；在
-`require_composition_contract: true`（`run_stage2.sh` 的正式数据路径固定开启）下，还会要求每个
+`require_composition_contract: true`（正式数据路径固定开启）下，还会要求每个
 `point_lights` 与 `in_scene_lights` 都带 `camera_position`，并校验它与 `position` 的换算结果一致，
 缺失或不一致的 manifest 会被数据门直接拒绝。
 
@@ -351,43 +365,35 @@ python -m datacompose.coordinates old_manifests new_manifests --allow-missing-in
 ## 6. 运行
 
 ```bash
-# 统一入口（cwd 为仓库根目录，或先 pip install -e .）
-python -m datacompose.cli prepare-objects      --config configs/default.yaml
-python -m datacompose.cli prepare-scenes       --config configs/default.yaml --blender-bin /opt/blender-4.5/blender
-python -m datacompose.cli annotate-construction --config configs/default.yaml --base-url http://127.0.0.1:8000/v1
-python -m datacompose.cli prepare-geometry     --config configs/default.yaml
-python -m datacompose.cli build-render-jobs    --config configs/default.yaml
-python -m datacompose.cli render               --config configs/default.yaml --blender-bin /opt/blender-4.5/blender
-python -m datacompose.cli clear-render-partial --config configs/default.yaml --job-id <job_id>
+# 在 datacompose 的“上一级目录”运行（即包含 datacompose/ 的目录），
+# 或 pip install -e 后从任意目录运行。--config 默认即 datacompose/configs/default.yaml。
+python -m datacompose.cli prepare-objects
+python -m datacompose.cli prepare-scenes       --blender-bin /opt/blender-4.5/blender
+python -m datacompose.cli annotate-construction --base-url http://127.0.0.1:8000/v1
+python -m datacompose.cli prepare-geometry
+python -m datacompose.cli build-render-jobs
+python -m datacompose.cli render               --blender-bin /opt/blender-4.5/blender
+python -m datacompose.cli clear-render-partial --job-id <job_id>
 ```
 
-Blender 侧的调用路径由 `scene_extract.py` 和 `render_compositions.py` 以
-`<config.root>/datacompose/blender/*.py` 拼出；`render_composition.py` 再从自身文件位置解析
-`tokenlight/render_assets.py` 与 `render_recovery.py`，因此可以从任意工作目录启动 Blender。
+Blender 侧的调用路径由 `scene_extract.py` 和 `render_compositions.py` 从**包自身位置**解析
+（`datacompose/blender/*.py`），不依赖 `config.root`，因此可从任意工作目录启动 Blender。
+数据与输出路径由 config 的 `paths`（相对 `project.root`）决定，默认落在本目录内，可用自定义
+`--config` 指向外部数据目录。
 
-完整编排：
-
-```bash
-cp datacompose/stage2/stage2.env.example datacompose/stage2/stage2.env
-vim datacompose/stage2/stage2.env
-STAGE2_ENV_FILE=datacompose/stage2/stage2.env bash datacompose/stage2/run_stage2.sh data
-STAGE2_ENV_FILE=datacompose/stage2/stage2.env bash datacompose/stage2/run_stage2.sh tests
-```
-
-`run_stage2.sh` 把 `PYTHONPATH` 设为仓库根目录，于是 `python -m datacompose.cli` 与
-`python -c "import datacompose"` 都可用。
+训练/编排（原 stage2，依赖 Lumina-T2X）已不在本独立 compose 项目内，请在本目录之外单独进行。
 
 ---
 
 ## 7. 验收
 
 ```bash
-python -m unittest discover -s tests -p 'test_*.py'
+python -m unittest discover -s datacompose/tests -p 'test_*.py'
 ```
 
-坐标相关的检查集中在 `tests/test_coordinates.py`：
+坐标相关的检查集中在 `datacompose/tests/test_coordinates.py`：
 
-- 同一 manifest 上，`datacompose.coordinates.convert_row()` 与根目录 `transfer.py` 的
+- 同一 manifest 上，`datacompose.coordinates.convert_row()` 与本目录 `transfer.py` 的
   `convert_row()` 产出逐位相等的 `camera_position`；
 - 两者对 `renderer_position` 不一致的 manifest 都报错；
 - `canonical ↔ camera`、`world ↔ camera` 往返一致；
@@ -396,10 +402,10 @@ python -m unittest discover -s tests -p 'test_*.py'
 - 镜头平移只改变主点，不改变焦距；
 - 目录转换是原子的，且默认拒绝覆盖。
 
-Blender 侧另有 `tests/blender_composition_focus.py`，用真实相机验证取景、遮挡与灯具可见性：
+Blender 侧另有 `datacompose/tests/blender_composition_focus.py`，用真实相机验证取景、遮挡与灯具可见性：
 
 ```bash
-/opt/blender-4.5/blender --background --factory-startup --python tests/blender_composition_focus.py
+/opt/blender-4.5/blender --background --factory-startup --python datacompose/tests/blender_composition_focus.py
 ```
 
 ---
@@ -412,18 +418,20 @@ Blender 侧另有 `tests/blender_composition_focus.py`，用真实相机验证�
 | `src/lightconstruction/cli.py` | `datacompose/cli.py` |
 | `scripts/blender_entry.py` | `datacompose/blender/entry.py` |
 | `scripts/blender_render_composition.py` | `datacompose/blender/render_composition.py` |
-| `scripts/stage2_config.py` | `datacompose/stage2/config.py` |
-| `scripts/run_stage2.sh` | `datacompose/stage2/run_stage2.sh` |
-| `scripts/stage2.env.example` | `datacompose/stage2/stage2.env.example` |
 | `Lumina-T2X/tools/tokenlight_data/render_assets.py` | `datacompose/tokenlight/render_assets.py` |
 | `Lumina-T2X/tools/tokenlight_data/build_manifests.py` | `datacompose/tokenlight/build_manifests.py` |
 | `Lumina-T2X/tools/tokenlight_data/validate_components.py` | `datacompose/tokenlight/validate_components.py` |
+| 仓库根目录 `configs/*.yaml` | `datacompose/configs/*.yaml` |
+| 仓库根目录 `tests/*.py` | `datacompose/tests/*.py` |
+| 仓库根目录 `transfer.py` | `datacompose/transfer.py` |
 | `python -m lightconstruction.cli` | `python -m datacompose.cli` |
 | `from lightconstruction.x import y` | `from datacompose.x import y` |
-| `from scripts.stage2_config import y` | `from datacompose.stage2.config import y` |
 
-`transfer.py` 仍保留在仓库根目录，作为坐标约定的参考实现；`datacompose/coordinates.py` 是它的模块化
+`transfer.py` 现位于本目录，作为坐标约定的参考实现；`datacompose/coordinates.py` 是它的模块化
 版本，多写 `image_plane`，其余数值行为与它一致。
+
+> 训练/编排相关的旧 `scripts/stage2_config.py`、`scripts/run_stage2.sh`、`stage2.env.example`
+> 已移出本独立 compose 项目（本项目只做数据合成 M1–M4）。
 
 ---
 
@@ -448,3 +456,184 @@ Blender 侧另有 `tests/blender_composition_focus.py`，用真实相机验证�
 **manifest 里没有 `intrinsics` 怎么办？**
 说明它由更早版本的渲染器生成。用 `--resolution WIDTHxHEIGHT` 给出像素尺寸，转换器会从
 `angle_x/angle_y` + `shift_x/shift_y` 重新算出内参；连视场角也没有时，只能得到深度与归一化坐标。
+
+---
+
+## 10. 物理表征通道（albedo / irradiance / normal）
+
+这一节描述 `m4.render.passes` 打开的**内在物理通道**。该开关写在操作者传入的 `--config`
+的 `m4.render` 下；datacompose 内的代码默认 `enabled: false`（见 `_render_config`），
+**不依赖任何外部样例配置**。它们与现有的
+ambient / dark / point / diffuse / fixture 分量并存，**默认关闭**（`passes.enabled: false`），
+关闭时产物与既有数据逐字节一致。开关打开后，每个 job 额外产出 3 张物理表征图 + 材质审计 + 质量
+统计，用于蒸馏训练的本征分解监督（训练侧改动不在本仓库范围内）。
+
+### 10.1 精确定义
+
+```text
+albedo(p)        = Cycles Diffuse Color(p)                       # 线性、无光照、无高光
+irradiance_L(p)  = (DiffuseDirect_L + DiffuseIndirect_L)(p) / max(albedo(p), eps)   # = E_L/π
+normal_camera(p) = R_cam^T · N_world(p)                          # 单位向量，X 右 / Y 下 / Z 前
+valid(p)         = albedo(p) ≥ eps   且   ||N_world(p)|| ≈ 1
+eps 默认 1e-3
+```
+
+- `albedo` 直接取 Cycles 的 **Diffuse Color** pass，与光照无关，因此同一物体的 albedo 在所有光照
+  分量下都相同，一次渲染即可复用。
+- `irradiance_L` 是**推导值**：把该分量渲染出的 `DiffuseDirect + DiffuseIndirect` 除以 albedo。
+  它等于余弦加权辐照度除以 π，即“同一光照下白色朗伯表面会反出的值”。推导**复用**了已有分量的
+  渲染 pass，**不增加分量渲染次数**。
+- `normal_camera` 用相机基向量投影 `R_cam = [right, up, forward]`，转到 OpenCV 相机系
+  （X 右、Y **下**、Z 前），与 manifest 里的 `camera_position` 同一坐标系。`intrinsic.world_normals_to_camera`
+  负责这个转换（Y 轴取负）。
+- `valid_mask` 标出可用的像素：albedo 三通道都 ≥ eps **且** 背后确有几何（法线非零）。
+
+> 也可以把 `irradiance_mode` 设为 `override`：用白色朗伯材质覆盖渲染、发光灯具除外，得到精确对照，
+> 渲染时间约 ×2，**不默认开启**。
+
+### 10.2 产出布局
+
+```text
+components/<job_id>/
+└── passes/
+    ├── albedo.exr              # 每 job 一张（Diffuse Color）
+    ├── normal_camera.exr       # 每 job 一张（相机空间单位法线）
+    ├── normal_world.exr        # 可选（save_normal_world: true）
+    ├── valid_mask.png          # 每 job 一张，8-bit
+    ├── material_audit.json     # 每 job 一份，见 10.4
+    └── irradiance/
+        ├── ambient.exr
+        ├── point_000.exr … point_015.exr
+        └── fixture_000.exr
+```
+
+`metadata.json` 新增 `passes` 块（路径相对 dataset 根）：
+
+```json
+"passes": {
+  "definition": {"albedo": "cycles_diffuse_color", "irradiance": "diffuse_radiance_over_albedo",
+                 "normal": "camera_space_unit_opencv", "eps": 0.001},
+  "albedo": "components/<id>/passes/albedo.exr",
+  "normal_camera": "components/<id>/passes/normal_camera.exr",
+  "valid_mask": "components/<id>/passes/valid_mask.png",
+  "material_audit": "components/<id>/passes/material_audit.json",
+  "quality": {"base_color_linked_ratio": 0.98, "magenta_ratio": 0.0, "textured_pixel_ratio": 0.34},
+  "irradiance": {"ambient": "...", "point_000": "...", "fixture_000": "..."}
+}
+```
+
+`build_manifests.py` 逐行透传 `metadata.json`，不改写 `passes` 路径；`dataset_release.json` 增加
+`intrinsic_passes: {enabled, rows_with_passes, definitions, quality_thresholds}` 汇总。
+
+### 10.3 与 TokenLight 分量的配对方式
+
+- `irradiance/ambient.exr` ↔ metadata 的 `ambient` 分量；
+- `irradiance/point_000.exr` ↔ `point_lights[0]`，编号与 `point_lights/light_000.exr` 一致；
+- `irradiance/fixture_000.exr` ↔ `in_scene_lights[0]`（fixture）。
+
+因此对任意分量分量 L 存在恒等式（在 `valid` 像素上）：
+
+```text
+component_L(p) − dark(p)  ≈  albedo(p) × irradiance_L(p)
+```
+
+这也是 §7/§10.7 的验收依据：`albedo>0.1` 的像素上相对误差中位数应 < 5%。
+
+**金属 / 玻璃缺口**：金属与玻璃的漫反射分量接近 0，`albedo≈0`。此时 `albedo × irradiance`
+恒等式在该像素不成立，除法也会放大噪声，因此这些像素被 `valid_mask` 直接排除，而不是猜测。
+`eps` 之下的像素不参与任何本征统计。
+
+### 10.4 材质接入判定（三层）
+
+#### 第一层：渲染前材质审计（决定性，`audit_materials()`）
+
+在 Blender 内遍历 `bpy.data.materials`，对含 **Image Texture** 节点的材质记录：
+
+```json
+{"material": "...", "has_nodes": true, "principled": true,
+ "base_color_linked": true, "base_color_image": "…_BaseColor.dds",
+ "image_exists": true, "image_size": [2048, 2048],
+ "normal_linked": true, "metallic_linked": true, "roughness_linked": true}
+```
+
+汇总：`materials / textured / base_color_linked / base_color_linked_ratio / missing_image_files / missing_examples`。
+
+判定规则：
+
+- `image_exists=false` 或 `image_size` 为 0×0 → **等同没接上**（`base_color_linked=false`）；
+- 只统计“节点树里含 Image Texture 的材质”作为分母，纯色材质不冤枉成失败；
+- `base_color_linked` 要求 Base Color 能沿节点链追溯到 Image Texture 且该图存在；
+- `require_textures: true` 时，`base_color_linked_ratio < min_base_color_linked_ratio(0.9)`
+  或 `missing_image_files > 0` → **该 job 直接失败**，错误信息附前 10 个失败材质名。
+
+#### 第二层：渲染后 albedo 统计（自动，`intrinsic.albedo_quality()`）
+
+| 指标 | 算法 | 阈值 |
+|---|---|---|
+| `magenta_ratio` | R>0.99 & G<0.01 & B>0.99 的像素占比（Blender 缺图渲染成品红） | `> 1e-4` 报错 |
+| `textured_pixel_ratio` | 5×5 局部方差 > 1e-6 的像素占比 | `< 0.02` 且 `require_textures` 时报错，否则仅告警 |
+| `unique_colors` | 量化到 8-bit 后的唯一色数 | `< 100` 且 `textured_pixel_ratio` 低时告警 |
+
+第三层（目视）与第一/二层的阈值共同作为数据门：`validate_components.py` 在 `scene["passes"]` 存在时
+做结构性检查（始终报错）与质量检查（`require_textures=true` 报错，否则写入 `counts["pass_warnings"]`）。
+
+#### 第三层：抽样目视（人工）
+
+挑 3～5 个**已知带贴图**的物体，把 `albedo.exr` 的线性值按 sRGB（gamma 2.2）转成 PNG，与源
+`*_BaseColor.dds` 并排比对。重点看两件事：
+
+1. **接没接上**：标签/文字是否可辨；纯色/品红 = 没接上。
+2. **接没接错**：颜色空间必须是 **sRGB**。若被误当 Non-Color，图像会整体偏亮/偏暗但**仍有纹理**，
+   这一层只能靠目视发现（第一/二层的统计无法区分）。
+
+### 10.5 sRGB 陷阱
+
+`albedo` 通道必须保持**线性**（EXR 里存的就是线性值）。若要导出 PNG 做目视，务必显式做
+`sRGB = linear^(1/2.2)`（或标准 sRGB 传输函数）后写入；把线性值直接当 sRGB 写、或把 sRGB 图片当
+线性读，都会得到偏亮/偏暗的结果。DDS 基础色贴图通常是 sRGB 编码，Blender 里对应 Image Texture 节点
+应设为 `sRGB` colorspace；若脚本误设为 `Non-Color`，渲染出的 albedo 会偏亮，且第二层统计仍判定“有纹理”。
+
+### 10.6 开关与成本
+
+```yaml
+m4:
+  render:
+    passes:
+      enabled: false              # 默认关闭，现有数据逐字节不变
+      albedo: true
+      normal: true
+      irradiance: true
+      irradiance_mode: derived    # derived | override
+      normal_space: camera        # camera | world
+      save_normal_world: false
+      pass_samples: 1
+      eps: 0.001
+      denoise_passes: false
+      require_textures: false
+      min_base_color_linked_ratio: 0.9
+      max_magenta_ratio: 0.0001
+```
+
+成本（`derived` 模式）：`+2` 次 1-sample 渲染/job（albedo、normal 参考），`+~19` 个 EXR/job。
+512² RGB half ≈ 1.5 MB/张 → 约 +28 MB/job；960² 约 +100 MB/job；时间增量预计 < 10%。
+`override` 模式约 ×2 渲染时间，仅作对照。回滚只需把 `passes.enabled` 改回 `false`，代码路径与现状一致。
+
+### 10.7 验收命令
+
+```bash
+# P0：纯 NumPy 单测（无需 GPU / Blender）
+python -m unittest discover -s datacompose/tests -p 'test_intrinsic_passes.py' -v
+
+# 渲染 1 个 job 的 passes（服务器，需 Blender 4.5）：
+python -m datacompose.cli render --blender-bin /opt/blender-4.5/blender
+# 然后在 config 里把 m4.render.passes.enabled 置 true 重跑该 job，
+# 人工比对 3 个带贴图物体的 albedo 与 *_BaseColor.dds。
+
+# P2：数据门
+python -m datacompose.tokenlight.validate_components --config <dataset-config>.yaml
+```
+
+验收标准（P2 结束）：10 个 job 全部通过 `validate_components`；`albedo × irradiance ≈ component − dark`
+在 `albedo>0.1` 像素上的相对误差中位数 < 5%；`magenta_ratio = 0`；单 job 输出增量在预算内；
+关闭开关后产物与当前一致。
+

@@ -1,0 +1,39 @@
+# Keys and values are normalized to lower snake_case before matching.
+aliases:
+  ashtray: ashtray
+  bar_counter: counter
+  beer_glass: beer_glass
+  bottle: bottle
+  cabinet: cabinet
+  cash_register: cash_register
+  chair: chair
+  cookie_jar: cookie_jar
+  cooler: cooler
+  coasters: coaster
+  coaster: coaster
+  cup: cup
+  cutlery: cutlery
+  fork: fork
+  glass_beer: beer_glass
+  glass_detailed: drinking_glass
+  glass_water: water_glass
+  glass_wine: wine_glass
+  lamp: lamp
+  lantern: lantern
+  liquor_bottle: bottle
+  liquorbottle: bottle
+  napkin_holder: napkin_holder
+  napkinholder: napkin_holder
+  paris_liquor_bottle: bottle
+  paris_liquorbottle: bottle
+  paris_plate: plate
+  plate: plate
+  plates: plate
+  shelf: shelf
+  spoon: spoon
+  stool: stool
+  table: table
+  trashcan: trash_can
+  wicker_basket: basket
+  wickerbasket: basket
+

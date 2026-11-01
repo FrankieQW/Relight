@@ -1,0 +1,12 @@
+# M4 geometry contract. Values are meters. Every category entering formal
+# rendering needs a reviewed rule here or an object-level override.
+#
+# Example:
+# categories:
+#   mug:
+#     target_dimensions: [0.10, 0.10, 0.12]
+#     up_axis: +Z
+#     front_axis: -Y
+#     contact_axis: -Z
+#     fit_mode: uniform_fit
+categories: {}

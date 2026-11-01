@@ -1,0 +1,13 @@
+# M4 per-object exceptions. Keys are Objaverse UIDs.
+#
+# Example:
+# objects:
+#   0123456789abcdef0123456789abcdef:
+#     target_dimensions: [0.20, 0.08, 0.12]
+#     up_axis: +Y
+#     front_axis: +Z
+#     contact_axis: -Y
+#     fit_mode: uniform_fit
+#
+# Set disabled: true to quarantine a known-bad asset.
+objects: {}

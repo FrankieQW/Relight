@@ -58,7 +58,7 @@ def render_compositions(
     render_config = _resolved_render_config(config, m4.get("render", {}))
     runtime_root = output_root / "runtime"
     runtime_root.mkdir(parents=True, exist_ok=True)
-    script = config.root / "datacompose" / "blender" / "render_composition.py"
+    script = Path(__file__).resolve().parent / "blender" / "render_composition.py"
     if not script.is_file():
         raise FileNotFoundError(script)
 

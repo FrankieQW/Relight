@@ -15,6 +15,7 @@ import traceback
 from typing import Any
 
 import bpy
+import numpy as np
 from bpy_extras.object_utils import world_to_camera_view
 from mathutils import Quaternion, Vector
 from mathutils.bvhtree import BVHTree
@@ -98,6 +99,14 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
         bpy.ops.wm.open_mainfile(filepath=str(blend_path))
         render_config = _render_config(runtime.get("render", {}))
         helpers.configure_render(render_config)
+        passes_config = render_config.get("passes") or {}
+        passes_enabled = bool(passes_config.get("enabled", False))
+        intrinsic = None
+        coordinates = None
+        if passes_enabled:
+            helpers.configure_passes(render_config)
+            intrinsic = _load_intrinsic()
+            coordinates = _load_coordinates()
         base_fingerprint = _scene_fingerprint()
         target_objects = _entity_objects(job["target"]["entity_id"])
         if not target_objects:
@@ -110,6 +119,26 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
                 hidden_target_names.append(obj.name)
 
         imported, meshes = helpers.import_asset(object_path)
+        passes_dir = partial / "passes"
+        material_audit = None
+        if passes_enabled:
+            passes_dir.mkdir(parents=True, exist_ok=True)
+            material_audit = helpers.audit_materials()
+            (passes_dir / "material_audit.json").write_text(
+                json.dumps(material_audit, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            problems = intrinsic.evaluate_material_audit(
+                material_audit,
+                min_base_color_linked_ratio=float(
+                    passes_config.get("min_base_color_linked_ratio", 0.9)
+                ),
+                require_textures=bool(passes_config.get("require_textures", False)),
+            )
+            if problems:
+                raise ValueError(
+                    "material audit gate failed (require_textures=true): " + "; ".join(problems)
+                )
         root, initial_scale = _normalize_imported(
             imported, meshes, job["prepared_geometry"], job["target"]
         )
@@ -167,18 +196,68 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
         visibility_path = partial / "diagnostics" / "inserted_visibility.png"
         shutil.copyfile(camera_result["mask_path"], visibility_path)
         inserted_pixels = int(camera_result["visible_pixels"])
+
+        passes_ctx = None
+        quality = None
+        if passes_enabled:
+            eps = float(passes_config.get("eps", 0.001))
+            passes_dir.mkdir(parents=True, exist_ok=True)
+            reference = helpers.render_pass_reference(passes_dir, passes_config)
+            albedo_image = helpers.read_linear_image(reference["albedo"])
+            normal_world = helpers.read_linear_image(reference["normal_world"])
+            frame = coordinates.CameraFrame.from_row(
+                {
+                    "canonical": {
+                        "origin": [float(value) for value in camera_target],
+                        "position_axes": "x=right,y=camera-forward,z=up",
+                    },
+                    "camera": {
+                        "location": [float(value) for value in camera.location],
+                        "target": [float(value) for value in camera_target],
+                        "rotation_euler": [float(value) for value in camera.rotation_euler],
+                    },
+                }
+            )
+            normal_camera = intrinsic.world_normals_to_camera(normal_world, frame)
+            valid = intrinsic.valid_mask(albedo_image, normal_world, eps=eps)
+            quality = intrinsic.albedo_quality(albedo_image)
+            helpers.save_linear_image(passes_dir / "normal_camera.exr", normal_camera)
+            helpers.save_mask_image(passes_dir / "valid_mask.png", valid.astype(np.float32))
+            if not bool(passes_config.get("save_normal_world", False)):
+                (passes_dir / "normal_world.exr").unlink(missing_ok=True)
+            passes_ctx = {
+                "enabled": True,
+                "dir": passes_dir,
+                "config": passes_config,
+                "eps": eps,
+                "irradiance": {},
+            }
+
         ambient_path = partial / "ambient.exr"
         background.inputs["Strength"].default_value = float(render_config["ambient_world_strength"])
-        helpers.render_exr(ambient_path)
+        if passes_ctx is not None and bool(passes_config.get("irradiance", True)):
+            outcome = helpers.render_exr(
+                ambient_path,
+                passes_ctx["dir"],
+                ("irradiance",),
+                name="ambient",
+                eps=passes_ctx["eps"],
+            )
+            if "irradiance" in outcome:
+                passes_ctx["irradiance"]["ambient"] = _future_relative(
+                    outcome["irradiance"], partial, final_directory, output_root
+                )
+        else:
+            helpers.render_exr(ambient_path)
         background.inputs["Strength"].default_value = 0.0
         dark_path = partial / "dark.exr"
         helpers.render_exr(dark_path)
 
         fixture_component = _render_fixture_component(
-            fixture, partial, output_root, final_directory, render_config, helpers
+            fixture, partial, output_root, final_directory, render_config, helpers, passes_ctx
         )
         point_components = _render_point_components(
-            partial, output_root, final_directory, camera, camera_target, render_config, helpers, rng
+            partial, output_root, final_directory, camera, camera_target, render_config, helpers, rng, passes_ctx
         )
         diffuse_components = _render_diffuse_components(
             partial, output_root, final_directory, camera, camera_target, render_config, helpers
@@ -189,6 +268,40 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
             "position_axes": "x=right,y=camera-forward,z=up",
             "units": "meter",
         }
+        passes_metadata = None
+        if passes_ctx is not None:
+            passes_metadata = {
+                "definition": {
+                    "albedo": "cycles_diffuse_color",
+                    "irradiance": "diffuse_radiance_over_albedo",
+                    "normal": "camera_space_unit_opencv",
+                    "eps": float(passes_ctx["eps"]),
+                },
+                "albedo": _future_relative(
+                    passes_dir / "albedo.exr", partial, final_directory, output_root
+                ),
+                "normal_camera": _future_relative(
+                    passes_dir / "normal_camera.exr", partial, final_directory, output_root
+                ),
+                "valid_mask": _future_relative(
+                    passes_dir / "valid_mask.png", partial, final_directory, output_root
+                ),
+                "material_audit": _future_relative(
+                    passes_dir / "material_audit.json", partial, final_directory, output_root
+                ),
+                "quality": {
+                    "base_color_linked_ratio": (material_audit or {}).get(
+                        "base_color_linked_ratio"
+                    ),
+                    "magenta_ratio": float(quality["magenta_ratio"]),
+                    "textured_pixel_ratio": float(quality["textured_pixel_ratio"]),
+                },
+                "irradiance": dict(passes_ctx["irradiance"]),
+            }
+            if bool(passes_config.get("save_normal_world", False)):
+                passes_metadata["normal_world"] = _future_relative(
+                    passes_dir / "normal_world.exr", partial, final_directory, output_root
+                )
         metadata = {
             "schema_version": job["schema_version"],
             "id": job["job_id"],
@@ -264,6 +377,8 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
             "lineage": job["lineage"],
             "license": job["license"],
         }
+        if passes_metadata is not None:
+            metadata["passes"] = passes_metadata
         (partial / "metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
@@ -1166,7 +1281,9 @@ def _remove_fixture_mesh(mesh, material) -> None:
         bpy.data.materials.remove(material)
 
 
-def _render_fixture_component(fixture, partial, output_root, final_directory, config, helpers):
+def _render_fixture_component(
+    fixture, partial, output_root, final_directory, config, helpers, passes_ctx=None
+):
     mask_path = partial / "in_scene_lights" / "fixture_000_mask.png"
     mask_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(fixture["candidate_mask"], mask_path)
@@ -1181,7 +1298,20 @@ def _render_fixture_component(fixture, partial, output_root, final_directory, co
         )
     try:
         component_path = partial / "in_scene_lights" / "fixture_000_on.exr"
-        helpers.render_exr(component_path)
+        if passes_ctx is not None and bool(passes_ctx["config"].get("irradiance", True)):
+            outcome = helpers.render_exr(
+                component_path,
+                passes_ctx["dir"],
+                ("irradiance",),
+                name="fixture_000",
+                eps=passes_ctx["eps"],
+            )
+            if "irradiance" in outcome:
+                passes_ctx["irradiance"]["fixture_000"] = _future_relative(
+                    outcome["irradiance"], partial, final_directory, output_root
+                )
+        else:
+            helpers.render_exr(component_path)
     finally:
         if fixture.get("material") is not None:
             helpers.set_fixture_emission(fixture["material"], (1.0, 1.0, 1.0, 1.0), 0.0)
@@ -1201,7 +1331,9 @@ def _render_fixture_component(fixture, partial, output_root, final_directory, co
     }
 
 
-def _render_point_components(partial, output_root, final_directory, camera, target, config, helpers, rng):
+def _render_point_components(
+    partial, output_root, final_directory, camera, target, config, helpers, rng, passes_ctx=None
+):
     count = int(config["point_lights_per_scene"])
     if count < 1:
         return []
@@ -1216,7 +1348,17 @@ def _render_point_components(partial, output_root, final_directory, camera, targ
             light.data.shadow_soft_size = radius
             bpy.context.view_layer.update()
             path = partial / "point_lights" / f"light_{index:03d}.exr"
-            helpers.render_exr(path)
+            label = f"point_{index:03d}"
+            if passes_ctx is not None and bool(passes_ctx["config"].get("irradiance", True)):
+                outcome = helpers.render_exr(
+                    path, passes_ctx["dir"], ("irradiance",), name=label, eps=passes_ctx["eps"]
+                )
+                if "irradiance" in outcome:
+                    passes_ctx["irradiance"][label] = _future_relative(
+                        outcome["irradiance"], partial, final_directory, output_root
+                    )
+            else:
+                helpers.render_exr(path)
             rows.append(
                 {
                     "path": _future_relative(path, partial, final_directory, output_root),
@@ -1420,8 +1562,24 @@ def _render_config(value: dict[str, Any]) -> dict[str, Any]:
         "fixture_light_radius": 0.12,
         "fallback_emission_strength": 4.0,
         "require_verified_license": True,
+        "passes": {
+            "enabled": False,
+            "albedo": True,
+            "normal": True,
+            "irradiance": True,
+            "irradiance_mode": "derived",
+            "normal_space": "camera",
+            "save_normal_world": False,
+            "pass_samples": 1,
+            "eps": 0.001,
+            "denoise_passes": False,
+            "require_textures": False,
+            "min_base_color_linked_ratio": 0.9,
+            "max_magenta_ratio": 0.0001,
+        },
     }
     result = {**defaults, **(value or {})}
+    result["passes"] = {**defaults["passes"], **((value or {}).get("passes") or {})}
     return result
 
 
@@ -1567,6 +1725,26 @@ def _load_recovery():
     spec = importlib.util.spec_from_file_location("datacompose_render_recovery", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load render recovery helpers: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_intrinsic():
+    path = _datacompose_root() / "intrinsic.py"
+    spec = importlib.util.spec_from_file_location("datacompose_intrinsic", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load intrinsic helpers: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_coordinates():
+    path = _datacompose_root() / "coordinates.py"
+    spec = importlib.util.spec_from_file_location("datacompose_coordinates", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load coordinate helpers: {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
