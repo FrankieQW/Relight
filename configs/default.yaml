@@ -1,0 +1,97 @@
+# datasimplecompose —— 简单舞台数据合成配置（唯一入口）
+#
+# 用法：
+#   python render_assets.py --config configs/default.yaml
+#
+# 说明：本脚本由普通 Python 启动，会先用 PyYAML 读取本文件，写出
+# render_config.*.snapshot.json，再用 `blender --background --python render_assets.py`
+# 把快照交给 Blender 渲染。因此 Blender 内部不需要 PyYAML。
+
+paths:
+  # 资产根目录：递归扫描 .glb / .gltf / .fbx / .obj / .blend
+  object_root: /data/objaverse
+  # HDRI 根目录：递归扫描 .hdr / .exr；不需要就写 null
+  hdri_root: null
+  # 产物根目录：components/、manifests/、render_workers/ 都写在这里
+  render_output_root: outputs/dataset
+
+render:
+  # ---- Blender 与并行 ----
+  blender_executable: /opt/blender-4.5/blender
+  gpu_ids: [0]              # 非空、互不重复的非负编号；worker 按轮转分配
+  workers_per_gpu: 1        # 每张卡起几个 Blender 进程
+  threads_per_worker: auto  # auto 或 >=1 的整数
+
+  # ---- 渲染 ----
+  resolution: 960
+  engine: CYCLES
+  samples: 64
+  denoise: true
+  mask_samples: 1           # fixture mask 专用采样数
+  device: GPU
+  compute_device_type: CUDA
+  require_gpu: true
+  persistent_data: false
+
+  # ---- 采样与切分 ----
+  views_per_asset: 2
+  train_fraction: 0.8
+  validation_fraction: 0.1
+  test_fraction: 0.1        # 三者之和必须为 1
+  split_seed: 42
+  asset_limit: null         # null 表示不限制
+  overwrite: false          # 已存在 metadata.json 的样本默认跳过
+
+  # ---- 内禀通道（albedo / irradiance / normal），默认关闭 ----
+  # 关闭时输出与未引入 pass 时完全一致；开启后每个样本多出 passes/ 子目录。
+  passes:
+    enabled: false
+    albedo: true
+    normal: true
+    irradiance: true
+    irradiance_mode: derived        # diffuse_radiance_over_albedo
+    normal_space: camera            # camera = OpenCV 约定（x右 y下 z前）
+    save_normal_world: false        # 只在 passes/ 里保留 normal_camera.exr
+    pass_samples: 1
+    eps: 0.001                      # albedo 低于该值的像素不参与 irradiance
+    denoise_passes: false
+    require_textures: false         # true 时贴图缺失/未连接会直接报错
+    min_base_color_linked_ratio: 0.9
+    max_magenta_ratio: 0.0001
+
+  # ---- 简单舞台（程序化场景，不需要任何真实 scene 数据）----
+  canonical_size: 1.5       # 资产归一化后的最长边（米）
+  ground_size: 8.0          # 地面平面尺寸
+  stage_color: [0.18, 0.18, 0.18, 1.0]
+  add_back_wall: true       # 额外加一面背墙
+
+  # ---- 相机 ----
+  camera_distance: 3.5
+  camera_yaw_degrees: [-20.0, 20.0]
+  camera_pitch_degrees: [5.0, 25.0]
+  camera_target_height: 0.65
+  camera_focal_length: 50.0
+
+  # ---- 点光源分量 ----
+  point_lights_per_scene: 16
+  point_light_base_energy: 500.0
+  point_light_radius_range: [0.03, 0.25]
+  light_position_ranges:
+    x: [-1.2, 1.2]
+    y: [-0.6, 1.2]
+    z: [0.15, 1.8]
+
+  # ---- 漫射分量 ----
+  diffuse_sizes: [0.05, 0.2, 0.4, 0.7, 1.0, 1.5]
+  diffuse_light_position: [0.0, 0.3, 1.3]
+
+  # ---- 画面内灯具（场景内光源）分量 ----
+  in_scene_lights_per_scene: 1
+  in_scene_light_energy: 300.0
+  in_scene_light_radius: 0.12
+  in_scene_fixture_size: 0.08
+  in_scene_emission_strength: 4.0
+  in_scene_position_ranges:
+    x: [-0.8, 0.8]
+    y: [-0.6, -0.1]
+    z: [0.4, 1.2]

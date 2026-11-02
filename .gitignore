@@ -1,0 +1,4 @@
+outputs/
+*.snapshot.json
+__pycache__/
+*.pyc
