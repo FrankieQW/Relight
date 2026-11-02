@@ -712,7 +712,14 @@ def _load_intrinsic_module():
         if spec is None or spec.loader is None:
             raise RuntimeError(f"cannot load intrinsic helpers: {module_path}")
         module = _importlib_util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # dataclasses resolves annotations through sys.modules[cls.__module__],
+        # so the module must be registered before exec_module runs.
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(spec.name, None)
+            raise
         _INTRINSIC_MODULE = module
     return _INTRINSIC_MODULE
 
@@ -733,7 +740,15 @@ def _load_coordinates_module():
         if spec is None or spec.loader is None:
             raise RuntimeError(f"cannot load coordinate helpers: {module_path}")
         module = _importlib_util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # coordinates.py defines frozen dataclasses and dataclasses looks the
+        # class module up in sys.modules while processing them, so register the
+        # module first (otherwise None.__dict__ is raised).
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(spec.name, None)
+            raise
         _COORDINATES_MODULE = module
     return _COORDINATES_MODULE
 
@@ -751,7 +766,7 @@ PASSES_DEFAULTS = {
     "denoise_passes": False,
     "require_textures": False,
     "min_base_color_linked_ratio": 0.9,
-    "max_magenta_ratio": 0.0001,
+    "max_magenta_ratio": None,
 }
 
 
