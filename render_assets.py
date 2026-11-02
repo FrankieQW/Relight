@@ -499,11 +499,15 @@ def configure_render(config: dict) -> None:
 
 
 PASS_SOCKETS = {
-    "albedo": "Diffuse Color",
-    "normal_world": "Normal",
-    "direct": "Diffuse Direct",
-    "indirect": "Diffuse Indirect",
-    "color": "Diffuse Color",
+    # Blender 4.5 renamed the Render Layers passes to short identifiers:
+    # "Diffuse Color" -> "DiffCol", "Diffuse Direct" -> "DiffDir",
+    # "Diffuse Indirect" -> "DiffInd".  Every key lists its known spellings and
+    # the first available socket wins, so 4.2-4.5 all resolve.
+    "albedo": ("Diffuse Color", "DiffCol"),
+    "normal_world": ("Normal",),
+    "direct": ("Diffuse Direct", "DiffDir"),
+    "indirect": ("Diffuse Indirect", "DiffInd"),
+    "color": ("Diffuse Color", "DiffCol"),
 }
 
 
@@ -549,16 +553,24 @@ def _set_file_output_prefix(node, path: str) -> str:
     )
 
 
-def _render_layer_socket(layers, name: str):
-    """Look up a render-layer pass socket, failing with the real available names."""
-    socket = layers.outputs.get(name)
-    if socket is None:
-        available = ", ".join(output.name for output in layers.outputs)
-        raise RuntimeError(
-            f"render layer pass {name!r} is unavailable on Blender "
-            f"{bpy.app.version_string}; available: {available}"
-        )
-    return socket
+def _render_layer_socket(layers, candidates):
+    """Resolve a render-layer pass socket, tolerating renamed sockets.
+
+    ``candidates`` is either one name or a sequence of accepted spellings; the
+    first socket that exists wins.  Failing that, the message lists the names
+    the node really exposes.
+    """
+    if isinstance(candidates, str):
+        candidates = (candidates,)
+    for name in candidates:
+        socket = layers.outputs.get(name)
+        if socket is not None:
+            return socket
+    available = ", ".join(output.name for output in layers.outputs)
+    raise RuntimeError(
+        f"none of the render layer passes {tuple(candidates)} is available on "
+        f"Blender {bpy.app.version_string}; available: {available}"
+    )
 
 
 def configure_passes(config: dict) -> None:
