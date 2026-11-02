@@ -41,6 +41,7 @@ render:
   split_seed: 42
   asset_limit: null         # null 表示不限制
   overwrite: false          # 已存在 metadata.json 的样本默认跳过
+  fail_fast: false          # true = 首个异常直接抛出（排查问题用，会中断整批）
 
   # ---- 内禀通道（albedo / irradiance / normal），默认关闭 ----
   # 关闭时输出与未引入 pass 时完全一致；开启后每个样本多出 passes/ 子目录。
@@ -57,7 +58,7 @@ render:
     denoise_passes: false
     require_textures: false         # true 时贴图缺失/未连接会直接报错
     min_base_color_linked_ratio: 0.9
-    max_magenta_ratio: 0.0001
+    max_magenta_ratio: null         # null=不检查；给数值则 quality.magenta_ratio 超限即报错
 
   # ---- 简单舞台（程序化场景，不需要任何真实 scene 数据）----
   canonical_size: 1.5       # 资产归一化后的最长边（米）

@@ -114,6 +114,21 @@ valid(p)         = albedo(p) >= eps 且 ||N_world(p)|| > 0
 
 `scene_id = <资产名>_<相对路径 sha1 前 10 位>_v<视角序号>`。
 
+## 排查渲染错误
+
+单个样本的异常不会中断整批，但**默认只把 `repr(error)` 写进 `render_errors.jsonl`**，看不到行号。所以：
+
+- 每个 worker 的**第一条异常**会把完整 traceback 写到
+  `<render_output_root>/render_first_error.worker_XXX.txt`，同时打到 stdout；
+- `render_errors.jsonl` 的每条记录除 `asset/view/error` 外还带 `traceback` 字段；
+- 想立刻在终端看到堆栈：`fail_fast: true` + `asset_limit: 1` + `gpu_ids: [0]` + `workers_per_gpu: 1`，
+  只跑 1 个资产、1 个 worker，首个异常直接抛出，父进程会打印该 worker 的末尾输出。
+
+```bash
+# 最小复现
+python render_assets.py --config configs/debug.yaml   # 上面四个键的临时配置
+```
+
 ## 说明
 
 - 每个样本是**单物体**，没有 `base_scene_id` / `composition`（那是场景合成的字段）。

@@ -18,6 +18,7 @@ import random
 import subprocess
 import sys
 from threading import Thread
+import traceback
 
 
 SUPPORTED_ASSETS = {".glb", ".gltf", ".fbx", ".obj", ".blend"}
@@ -218,6 +219,27 @@ def blender_main() -> None:
         raise RuntimeError(f"没有找到支持的 3D asset: {asset_root}")
     worker_index = int(config.get("worker_index", 0))
     worker_count = int(config.get("worker_count", 1))
+    # Environment probe: answers Blender-version / API questions without a rerun.
+    try:
+        probe_scene = bpy.context.scene
+        (output_root / f"blender_env.worker_{worker_index:03d}.json").write_text(
+            json.dumps(
+                {
+                    "blender": bpy.app.version_string,
+                    "python": sys.version.split()[0],
+                    "scene_has_use_nodes": hasattr(probe_scene, "use_nodes"),
+                    "scene_has_node_tree": hasattr(probe_scene, "node_tree"),
+                    "scene_has_compositing_node_group": hasattr(
+                        probe_scene, "compositing_node_group"
+                    ),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
     indexed_assets = [
         (asset_index, asset_path)
         for asset_index, asset_path in enumerate(assets)
@@ -228,6 +250,7 @@ def blender_main() -> None:
     split_by_asset = assign_splits(assets, config)
     rows = {"train": [], "validation": [], "test": []}
     errors = []
+    wrote_trace = False
     seed = int(config["split_seed"])
     for asset_index, asset_path in indexed_assets:
         split = split_by_asset[asset_path]
@@ -238,8 +261,30 @@ def blender_main() -> None:
                 rows[split].append(metadata)
                 emit_progress("advance", scene=metadata["id"], split=split, failed=False)
             except Exception as error:
-                record = {"asset": str(asset_path), "view": view_index, "error": repr(error)}
+                formatted = traceback.format_exc()
+                record = {
+                    "asset": str(asset_path),
+                    "view": view_index,
+                    "error": repr(error),
+                    "traceback": formatted,
+                }
                 errors.append(record)
+                if not wrote_trace:
+                    # One full traceback per worker: the parent only forwards
+                    # progress lines, so persist it next to the snapshots.
+                    wrote_trace = True
+                    try:
+                        trace_path = (
+                            output_root
+                            / f"render_first_error.worker_{worker_index:03d}.txt"
+                        )
+                        trace_path.write_text(
+                            f"asset: {asset_path}\nview: {view_index}\n\n{formatted}",
+                            encoding="utf-8",
+                        )
+                    except OSError:
+                        pass
+                    print(formatted, flush=True)
                 emit_progress(
                     "advance",
                     scene=f"{asset_path.name}:v{view_index:02d}",
@@ -247,6 +292,8 @@ def blender_main() -> None:
                     failed=True,
                     error=repr(error),
                 )
+                if bool(config.get("fail_fast", False)):
+                    raise
     worker_root = output_root / "render_workers" / f"worker_{worker_index:03d}"
     for split, split_rows in rows.items():
         write_jsonl(worker_root / f"{split}.jsonl", split_rows)
@@ -460,6 +507,60 @@ PASS_SOCKETS = {
 }
 
 
+def _compositor_tree():
+    """Return ``(node_tree, source)`` for the scene compositor, across versions.
+
+    Blender 4.5+/5.x moved the scene compositor to ``compositing_node_group``;
+    older releases use ``Scene.node_tree`` behind ``Scene.use_nodes``.
+    """
+    scene = bpy.context.scene
+    tree = getattr(scene, "compositing_node_group", None)
+    if tree is not None:
+        return tree, "compositing_node_group"
+    if hasattr(scene, "use_nodes"):
+        scene.use_nodes = True
+    tree = getattr(scene, "node_tree", None)
+    if tree is None:
+        raise RuntimeError(
+            "cannot resolve the compositor node tree on Blender "
+            f"{bpy.app.version_string}: neither scene.compositing_node_group nor "
+            "scene.node_tree is available"
+        )
+    return tree, "node_tree"
+
+
+def _set_file_output_prefix(node, path: str) -> str:
+    """Set a File Output node's filename prefix, across Blender versions.
+
+    ``file_slots`` was replaced by ``file_output_items`` in newer releases, so
+    both are probed instead of assuming one.
+    """
+    slots = getattr(node, "file_slots", None)
+    if slots is not None and len(slots):
+        slots[0].path = path
+        return "file_slots"
+    items = getattr(node, "file_output_items", None)
+    if items is not None and len(items):
+        items[0].path = path
+        return "file_output_items"
+    raise RuntimeError(
+        f"{node.bl_idname} exposes neither file_slots nor file_output_items on "
+        f"Blender {bpy.app.version_string}"
+    )
+
+
+def _render_layer_socket(layers, name: str):
+    """Look up a render-layer pass socket, failing with the real available names."""
+    socket = layers.outputs.get(name)
+    if socket is None:
+        available = ", ".join(output.name for output in layers.outputs)
+        raise RuntimeError(
+            f"render layer pass {name!r} is unavailable on Blender "
+            f"{bpy.app.version_string}; available: {available}"
+        )
+    return socket
+
+
 def configure_passes(config: dict) -> None:
     """Enable Cycles passes and build the compositor outputs that write them.
 
@@ -474,11 +575,13 @@ def configure_passes(config: dict) -> None:
     view_layer.use_pass_diffuse_direct = True
     view_layer.use_pass_diffuse_indirect = True
     view_layer.use_pass_normal = True
-    scene.use_nodes = True
-    tree = scene.node_tree
-    for node in list(tree.nodes):
-        if node.name.startswith("LC_PASS_"):
-            tree.nodes.remove(node)
+    tree, _source = _compositor_tree()
+    if tree is None:
+        raise RuntimeError("compositor node tree is unavailable")
+    if hasattr(tree, "nodes"):
+        for node in list(tree.nodes):
+            if node.name.startswith("LC_PASS_"):
+                tree.nodes.remove(node)
     layers = next((node for node in tree.nodes if node.type == "R_LAYERS"), None)
     if layers is None:
         layers = tree.nodes.new("CompositorNodeRLayers")
@@ -486,21 +589,31 @@ def configure_passes(config: dict) -> None:
         output = tree.nodes.new("CompositorNodeOutputFile")
         output.name = f"LC_PASS_{key}"
         output.base_path = str(Path(bpy.context.blend_data.filepath or ".").parent)
-        output.format.file_format = "OPEN_EXR"
-        output.format.color_depth = "16"
-        output.format.color_mode = "RGB"
-        output.file_slots[0].path = f"{key}_"
+        image_format = getattr(output, "format", None)
+        if image_format is not None:
+            image_format.file_format = "OPEN_EXR"
+            image_format.color_depth = "16"
+            image_format.color_mode = "RGB"
+        _set_file_output_prefix(output, f"{key}_")
         output.mute = True
-        tree.links.new(layers.outputs[socket], output.inputs[0])
+        if not len(output.inputs):
+            raise RuntimeError(
+                f"{output.bl_idname} has no input socket on Blender "
+                f"{bpy.app.version_string}"
+            )
+        tree.links.new(_render_layer_socket(layers, socket), output.inputs[0])
 
 
 def _pass_outputs():
-    scene = bpy.context.scene
-    if not getattr(scene, "use_nodes", False) or scene.node_tree is None:
+    try:
+        tree, _source = _compositor_tree()
+    except RuntimeError:
+        return []
+    if tree is None or not hasattr(tree, "nodes"):
         return []
     return [
         node
-        for node in scene.node_tree.nodes
+        for node in tree.nodes
         if node.name.startswith("LC_PASS_") and node.type == "OUTPUT_FILE"
     ]
 
@@ -549,7 +662,7 @@ def render_with_passes(
         for key, node in outputs.items():
             node.mute = key not in active
             node.base_path = str(passes_dir)
-            node.file_slots[0].path = f"{key}_"
+            _set_file_output_prefix(node, f"{key}_")
         scene.render.filepath = str(
             combined_path if combined_path is not None else passes_dir / "_unused.exr"
         )
@@ -1098,11 +1211,8 @@ def render_scene(asset_path, asset_root, output_root, hdris, view_index, config,
         problems = intrinsic.evaluate_material_audit(
             material_audit,
             min_base_color_linked_ratio=float(passes["min_base_color_linked_ratio"]),
-            max_magenta_ratio=float(passes["max_magenta_ratio"]),
             require_textures=bool(passes.get("require_textures", False)),
         )
-        if problems:
-            raise ValueError(f"{sid}: material audit failed: " + "; ".join(problems))
         reference = render_pass_reference(passes_dir, passes)
         albedo_image = read_linear_image(reference["albedo"])
         normal_world = read_linear_image(reference["normal_world"])
@@ -1112,6 +1222,15 @@ def render_scene(asset_path, asset_root, output_root, hdris, view_index, config,
         normal_camera = intrinsic.world_normals_to_camera(normal_world, frame)
         valid = intrinsic.valid_mask(albedo_image, normal_world, eps=eps)
         quality = intrinsic.albedo_quality(albedo_image)
+        # Optional magenta gate: Blender renders missing textures as magenta.
+        magenta_limit = passes.get("max_magenta_ratio")
+        if magenta_limit is not None and float(quality["magenta_ratio"]) > float(magenta_limit):
+            problems.append(
+                "magenta placeholder pixels "
+                f"{float(quality['magenta_ratio']):.4f} > {float(magenta_limit):.4f}"
+            )
+        if problems:
+            raise ValueError(f"{sid}: material audit failed: " + "; ".join(problems))
         save_linear_image(passes_dir / "normal_camera.exr", normal_camera)
         save_mask_image(passes_dir / "valid_mask.png", valid.astype("float32"))
         if not bool(passes.get("save_normal_world", False)):
