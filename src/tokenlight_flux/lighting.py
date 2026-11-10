@@ -365,6 +365,7 @@ class LightingConditionedTransformer(nn.Module):
         transformer: nn.Module,
         lighting_encoder: LightingTokenEncoder,
         fixture_mask_encoder: FixtureMaskEncoder | None = None,
+        intrinsic_decoder: nn.Module | None = None,
         *,
         ddp_trainable_only: bool = False,
         lighting_attention_mass: float = 0.05,
@@ -386,6 +387,10 @@ class LightingConditionedTransformer(nn.Module):
             self.transformer = transformer
         self.lighting_encoder = lighting_encoder
         self.fixture_mask_encoder = fixture_mask_encoder
+        # AIN head. It is a child module so DDP registers it together with the
+        # other trainable modules; it is only invoked from the training and
+        # validation loops because it consumes the predicted clean latent.
+        self.intrinsic_decoder = intrinsic_decoder
         self.ddp_trainable_only = bool(ddp_trainable_only)
         self.lighting_attention_mass = float(lighting_attention_mass)
         self.lighting_attention_bias_enabled = bool(lighting_attention_bias_enabled)

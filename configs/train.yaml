@@ -1,10 +1,14 @@
 paths:
   # Complete local Diffusers snapshot. Training never downloads missing files.
   pretrained_model: /home/frankie/models/FLUX.1-Kontext-dev
-  dataset_root: /home/frankie/data/tokenlight_1000obj_960_in_scene
-  train_manifest: /home/frankie/data/tokenlight_1000obj_960_in_scene/manifests/train.jsonl
-  validation_manifest: /home/frankie/data/tokenlight_1000obj_960_in_scene/manifests/validation.jsonl
-  test_manifest: /home/frankie/data/tokenlight_1000obj_960_in_scene/manifests/test.jsonl
+  # AIN intrinsically decomposed dataset: every scene metadata must carry a
+  # `passes` block (albedo / normal_camera / valid_mask + irradiance index).
+  # Adjust this root to wherever the dataset was re-rendered with
+  # `passes.enabled: true`.
+  dataset_root: /home/frankie/data/data_with_AIN
+  train_manifest: /home/frankie/data/data_with_AIN/manifests/train.jsonl
+  validation_manifest: /home/frankie/data/data_with_AIN/manifests/validation.jsonl
+  test_manifest: /home/frankie/data/data_with_AIN/manifests/test.jsonl
   output_root: /home/frankie/programs/Relight/outputs
   # Optional cache of generated condition/target PNGs and lighting metadata.
   composed_output_root: /home/frankie/data/composed_data
@@ -31,6 +35,26 @@ data:
     light_intensity: [0.3, 1.5]
     fixture_intensity: [0.4, 1.5]
     fixture_transition: [0.25, 1.0]
+  intrinsics:
+    enabled: true
+    # true = error when a sample has no `passes` block (recommended for the
+    # real AIN run); false = silently train without AIN targets on such scenes.
+    require: true
+
+# AIN intrinsic supervision. With `enabled: false` the whole feature is inert:
+# the dataset returns no intrinsic_* keys, no decoder is built, and the loss is
+# exactly the plain flow-matching objective.
+intrinsic:
+  enabled: true
+  weight: 0.1              # omega: total AIN loss weight
+  albedo_weight: 1.0       # lambda_A
+  normal_weight: 1.0       # lambda_N
+  irradiance_weight: 1.0   # lambda_I
+  head_resolution: 120     # supervision resolution: 60 / 120 / 240
+  hidden_channels: 256
+  sigma_weight_power: 1.0  # p in w(sigma) = clamp((1-sigma)/tau, 0, 1) ** p
+  sigma_weight_tau: 1.0    # tau
+  sigma_max: 1.0           # samples with sigma > this contribute no AIN loss
 
 model:
   max_lights: 3
@@ -85,7 +109,7 @@ train:
   guidance_scale: 3.5
   vae_encode_mode: mode
   seed: 42
-  run_name: flux_kontext_tokenlight_lora_fixture_mask
+  run_name: flux_kontext_tokenlight_lora_intrinsic
 
 infer:
   steps: 28

@@ -59,6 +59,14 @@ class TokenLightKontextDataset(Dataset):
         self.task_probabilities = dict(data["task_probabilities"])
         self.max_lights = int(config["model"]["max_lights"])
         self.fixture_mask_enabled = bool(config["model"]["fixture_mask_enabled"])
+        intrinsic_data = data.get("intrinsics") or {}
+        if not isinstance(intrinsic_data, dict):
+            raise ValueError("data.intrinsics must be a mapping")
+        self.intrinsics_enabled = bool(intrinsic_data.get("enabled", False))
+        self.intrinsics_require = bool(intrinsic_data.get("require", False))
+        self.head_resolution = int(
+            (config.get("intrinsic") or {}).get("head_resolution", self.resolution // 8)
+        )
         self.schema = LightingSchema(self.max_lights)
         self.ambient_range = _range(config, "ambient_scale")
         self.color_range = _range(config, "light_color")
@@ -106,6 +114,30 @@ class TokenLightKontextDataset(Dataset):
         ambient = self._read_linear(scene["ambient"])
         dark = self._read_linear(scene["dark"]) if scene.get("dark") else np.zeros_like(ambient)
         source, target, control = self._compose(scene, task, ambient, dark, rng)
+        intrinsic: dict[str, np.ndarray] = {}
+        has_intrinsic = False
+        if self.intrinsics_enabled:
+            scene_intr = self._scene_intrinsics(scene)
+            if scene_intr:
+                has_intrinsic = True
+                irradiance = self._compose_irradiance(scene, task, control, scene_intr)
+                intrinsic = {
+                    "intrinsic_albedo": self._prepare_intrinsic(scene_intr["albedo"], "albedo"),
+                    "intrinsic_normal": self._prepare_intrinsic(scene_intr["normal"], "normal"),
+                    "intrinsic_irradiance": self._prepare_intrinsic(irradiance, "irradiance"),
+                    "intrinsic_mask": self._prepare_intrinsic_mask(scene_intr["valid"]),
+                }
+            else:
+                # data.intrinsics.require=false: keep the batch contract
+                # homogeneous but mask every pixel, so this sample adds nothing
+                # to either the AIN numerator or its denominator.
+                size = self.head_resolution
+                intrinsic = {
+                    "intrinsic_albedo": np.zeros((size, size, 3), dtype=np.float32),
+                    "intrinsic_normal": np.zeros((size, size, 3), dtype=np.float32),
+                    "intrinsic_irradiance": np.zeros((size, size, 3), dtype=np.float32),
+                    "intrinsic_mask": np.zeros((size, size), dtype=np.float32),
+                }
         lighting = self.schema.pack(task, control)
         fixture_present = task == "in_scene_light" and self.fixture_mask_enabled
         if fixture_present:
@@ -125,6 +157,14 @@ class TokenLightKontextDataset(Dataset):
             raise ValueError(f"in_scene_light fixture mask is empty: {scene.get('id')}")
         condition_pixels = self._prepare_image(source)
         target_pixels = self._prepare_image(target)
+        intrinsic_pixels = {}
+        if has_intrinsic:
+            # Display mapping: _to_uint8 expects [-1, 1] for every channel.
+            intrinsic_pixels = {
+                "albedo": intrinsic["intrinsic_albedo"] * 2.0 - 1.0,
+                "normal": intrinsic["intrinsic_normal"],
+                "irradiance": intrinsic["intrinsic_irradiance"] * 2.0 - 1.0,
+            }
         if self.materialize and self.composed_output_root is not None:
             self._save_composed_sample(
                 index=index,
@@ -137,6 +177,7 @@ class TokenLightKontextDataset(Dataset):
                 lighting_valid=lighting.valid,
                 condition_pixels=condition_pixels,
                 target_pixels=target_pixels,
+                intrinsic_pixels=intrinsic_pixels,
             )
         return {
             "condition_pixel_values": torch.from_numpy(condition_pixels).permute(2, 0, 1),
@@ -152,6 +193,14 @@ class TokenLightKontextDataset(Dataset):
             "scene_id": str(scene["id"]),
             "sample_index": index,
             "sample_seed": sample_seed,
+            **{
+                key: (
+                    torch.from_numpy(value).permute(2, 0, 1)
+                    if value.ndim == 3
+                    else torch.from_numpy(value)[None]
+                )
+                for key, value in intrinsic.items()
+            },
         }
 
     def sample_path(self, index: int) -> Path | None:
@@ -182,6 +231,7 @@ class TokenLightKontextDataset(Dataset):
         lighting_valid: np.ndarray,
         condition_pixels: np.ndarray,
         target_pixels: np.ndarray,
+        intrinsic_pixels: dict[str, np.ndarray] | None = None,
     ) -> None:
         """Persist viewable source/target images and exact conditioning metadata."""
         sample_dir = self.sample_path(index)
@@ -196,6 +246,15 @@ class TokenLightKontextDataset(Dataset):
             try:
                 Image.fromarray(self._to_uint8(pixels), mode="RGB").save(temporary)
                 os.replace(temporary, sample_dir / f"{name}.png")
+            finally:
+                temporary.unlink(missing_ok=True)
+        # AIN passes are exported only for human inspection; they are not
+        # training inputs and are absent when intrinsic supervision is off.
+        for name, pixels in (intrinsic_pixels or {}).items():
+            temporary = sample_dir / f".intrinsic_{name}.{uuid.uuid4().hex}.png"
+            try:
+                Image.fromarray(self._to_uint8(pixels), mode="RGB").save(temporary)
+                os.replace(temporary, sample_dir / f"intrinsic_{name}.png")
             finally:
                 temporary.unlink(missing_ok=True)
         metadata = {
@@ -268,6 +327,10 @@ class TokenLightKontextDataset(Dataset):
                 "source_level": source_level,
                 "target_level": target_level,
                 "delta": target_level - source_level,
+                # AIN irradiance must be rebuilt from the components that actually
+                # took part in this composition.
+                "source_index": int(source_index),
+                "target_index": int(target_index),
             }
 
         if task == "add_light":
@@ -293,12 +356,20 @@ class TokenLightKontextDataset(Dataset):
                         "b": float(color[2]),
                         "intensity": intensity,
                         "softness": float(component.get("diffuse", 0.0)),
+                        "component_index": int(component_index),
                     }
                 )
             return ambient, target, {"lights": lights}
 
         fixtures = self._usable_fixtures(scene)
-        fixture = fixtures[int(rng.integers(len(fixtures)))]
+        selection = int(rng.integers(len(fixtures)))
+        fixture = fixtures[selection]
+        # Render passes are named by a fixture's position in the scene's own list,
+        # not by its position after mask/usability filtering.
+        fixture_index = next(
+            (index for index, item in enumerate(self._fixtures(scene)) if item is fixture),
+            selection,
+        )
         color = rng.uniform(*self.color_range, size=3).astype(np.float32)
         intensity = float(rng.uniform(*self.fixture_intensity_range))
         transition = float(rng.uniform(*self.fixture_transition_range))
@@ -311,6 +382,9 @@ class TokenLightKontextDataset(Dataset):
             "intensity": intensity,
             "transition": transition,
             "fixture_mask": fixture.get("mask"),
+            # Index into scene["in_scene_lights"], matching passes/irradiance naming.
+            "fixture_index": fixture_index,
+            "fixture_component": fixture,
         }
 
     def _supports(self, scene: dict[str, Any], task: str) -> bool:
@@ -360,12 +434,161 @@ class TokenLightKontextDataset(Dataset):
             raise ValueError(f"linear image contains NaN/Inf: {path}")
         return image
 
+    def _read_map(self, value: str | Path) -> np.ndarray:
+        """Read EXR/NPY values without exposure or tone mapping."""
+        path = self._resolve(value)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        if path.suffix.lower() == ".npy":
+            image = np.load(path).astype(np.float32)
+        else:
+            image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if image is None:
+                raise RuntimeError(f"cannot read intrinsic map: {path}")
+            image = image.astype(np.float32)
+            if image.ndim == 3:
+                image = cv2.cvtColor(image[..., :3], cv2.COLOR_BGR2RGB)
+        if image.ndim == 2:
+            image = np.repeat(image[..., None], 3, axis=2)
+        if image.ndim != 3 or image.shape[2] < 3:
+            raise ValueError(f"expected HWC RGB intrinsic map, got {path}: {image.shape}")
+        image = image[..., :3]
+        if not np.isfinite(image).all():
+            raise ValueError(f"intrinsic map contains NaN/Inf: {path}")
+        return image
+
+    @staticmethod
+    def _component_path(component: dict[str, Any]) -> str | Path | None:
+        """A light component renders to whatever field the dataset exposes."""
+        return component.get("path") or component.get("on")
+
+    def _scene_intrinsics(self, scene: dict[str, Any]) -> dict[str, Any]:
+        """Locate one scene's AIN passes.
+
+        Passes live in ``<component>/passes/``. The metadata ``passes`` block is
+        honoured when present, but the directory layout is authoritative on its
+        own, so a manifest line without a ``passes`` block still resolves.
+        """
+        passes = scene.get("passes") or {}
+        if not isinstance(passes, dict):
+            raise ValueError(f"scene passes block must be a mapping: {scene.get('id')}")
+        if not scene.get("ambient"):
+            raise ValueError(f"scene has no ambient render to locate passes: {scene.get('id')}")
+        passes_dir = self._resolve(scene["ambient"]).parent / "passes"
+        albedo = passes.get("albedo") or (passes_dir / "albedo.exr")
+        normal = passes.get("normal_camera") or (passes_dir / "normal_camera.exr")
+        mask = passes.get("valid_mask") or (passes_dir / "valid_mask.png")
+        if not all(self._resolve(path).is_file() for path in (albedo, normal, mask)):
+            if self.intrinsics_require:
+                raise ValueError(
+                    "scene has no AIN passes (expected albedo/normal_camera/valid_mask in "
+                    f"{passes_dir}): {scene.get('id')}"
+                )
+            return {}
+        return {
+            "albedo": self._read_map(albedo),
+            "normal": self._read_map(normal),
+            "valid": self._read_mask(mask),
+            "irradiance": dict(passes.get("irradiance") or {}),
+            "irradiance_dir": passes_dir / "irradiance",
+        }
+
+    def _compose_irradiance(
+        self, scene: dict[str, Any], task: str, control: dict[str, Any], intr: dict[str, Any]
+    ) -> np.ndarray:
+        """Rebuild E for the target composition so the AIN target matches the image."""
+        # Division by zero on background pixels would poison the map; the valid
+        # mask keeps those pixels out of the loss anyway.
+        albedo = np.maximum(intr["albedo"], 1e-3)
+        dark = self._read_linear(scene["dark"]) if scene.get("dark") else 0.0
+        index = intr["irradiance"]
+        irradiance_dir = intr.get("irradiance_dir")
+
+        def E_of(component: dict[str, Any], name: str) -> np.ndarray:
+            # 1) explicit index from the metadata passes block
+            path = index.get(name)
+            # 2) the renderer writes <component>/passes/irradiance/<name>.exr
+            if not path and irradiance_dir is not None:
+                for suffix in (".exr", ".npy"):
+                    candidate = irradiance_dir / f"{name}{suffix}"
+                    if candidate.is_file():
+                        path = candidate
+                        break
+            if path:
+                return self._read_map(path)
+            # 3) algebraically undo the render: E = (radiance - dark) / albedo
+            value = self._component_path(component)
+            if not value:
+                raise ValueError(f"light component has no render path: {name}")
+            radiance = self._read_linear(value)
+            return np.maximum(radiance - dark, 0.0) / albedo
+
+        e_ambient = E_of({"path": scene["ambient"]}, "ambient")
+
+        if task == "ambient_scale":
+            return e_ambient * float(control["scale"])
+
+        if task == "global_diffuse":
+            target_index = int(control["target_index"])
+            component = scene["diffuse"][target_index]
+            return e_ambient + E_of(component, f"diffuse_{target_index:02d}")
+
+        if task == "add_light":
+            total = e_ambient.copy()
+            for light in control["lights"]:
+                component_index = int(light["component_index"])
+                component = scene["point_lights"][component_index]
+                rgb = np.asarray([light["r"], light["g"], light["b"]], dtype=np.float32)
+                total = total + E_of(component, f"light_{component_index:03d}") * rgb[
+                    None, None, :
+                ] * float(light["intensity"])
+            return total
+
+        component = control["fixture_component"]
+        rgb = np.asarray([control["r"], control["g"], control["b"]], dtype=np.float32)
+        return e_ambient + E_of(
+            component, f"fixture_{int(control['fixture_index']):03d}"
+        ) * rgb[None, None, :] * float(control["intensity"]) * float(control["transition"])
+
     def _prepare_image(self, image: np.ndarray) -> np.ndarray:
         image = center_crop(np.maximum(image * self.exposure, 0.0))
         image = image / (1.0 + image)
         if image.shape[:2] != (self.resolution, self.resolution):
             image = cv2.resize(image, (self.resolution, self.resolution), interpolation=cv2.INTER_AREA)
         return np.ascontiguousarray(image * 2.0 - 1.0, dtype=np.float32)
+
+    def _prepare_intrinsic(self, image: np.ndarray, kind: str) -> np.ndarray:
+        """Center-crop/resize an AIN map to the supervision grid and normalise it."""
+        value = center_crop(image)
+        if value.shape[:2] != (self.head_resolution, self.head_resolution):
+            value = cv2.resize(
+                value,
+                (self.head_resolution, self.head_resolution),
+                interpolation=cv2.INTER_AREA,
+            )
+        if kind == "albedo":
+            value = np.clip(value, 0.0, 1.0)
+        elif kind == "normal":
+            norm = np.linalg.norm(value, axis=2, keepdims=True)
+            value = np.where(norm > 1e-6, value / np.maximum(norm, 1e-6), 0.0)
+        elif kind == "irradiance":
+            # Same exposure + Reinhard path as the supervised image, so the
+            # sigmoid head predicts exactly what the image pipeline represents.
+            value = np.maximum(value * self.exposure, 0.0)
+            value = value / (1.0 + value)
+        else:
+            raise ValueError(f"unknown intrinsic kind: {kind}")
+        return np.ascontiguousarray(value, dtype=np.float32)
+
+    def _prepare_intrinsic_mask(self, mask: np.ndarray) -> np.ndarray:
+        value = center_crop(mask)
+        if value.shape[:2] != (self.head_resolution, self.head_resolution):
+            value = cv2.resize(
+                value,
+                (self.head_resolution, self.head_resolution),
+                interpolation=cv2.INTER_AREA,
+            )
+        return np.ascontiguousarray((value > 0.5).astype(np.float32), dtype=np.float32)
 
     def _read_mask(self, value: str | Path) -> np.ndarray:
         path = self._resolve(value)
@@ -458,7 +681,7 @@ def load_fixture_mask(path: str | Path, resolution: int) -> torch.Tensor:
 def collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
     if not samples:
         raise ValueError("cannot collate an empty batch")
-    return {
+    batch = {
         "condition_pixel_values": torch.stack([sample["condition_pixel_values"] for sample in samples]),
         "target_pixel_values": torch.stack([sample["target_pixel_values"] for sample in samples]),
         "lighting_values": torch.stack([sample["lighting_values"] for sample in samples]),
@@ -473,3 +696,9 @@ def collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "sample_index": [sample["sample_index"] for sample in samples],
         "sample_seed": [sample["sample_seed"] for sample in samples],
     }
+    # Only present when data.intrinsics.enabled; keeping the keys out entirely
+    # is what makes the disabled path identical to the plain flow-matching run.
+    for key in ("intrinsic_albedo", "intrinsic_normal", "intrinsic_irradiance", "intrinsic_mask"):
+        if all(key in sample for sample in samples):
+            batch[key] = torch.stack([sample[key] for sample in samples])
+    return batch

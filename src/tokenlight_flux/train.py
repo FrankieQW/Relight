@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from .config import REQUIRED_MODEL_ENTRIES, load_config, validate_model_snapshot
 from .dataset import TokenLightKontextDataset, collate
+from .intrinsics import IntrinsicDecoder, ain_timestep_weight, intrinsic_losses
 from .lighting import (
     FixtureMaskEncoder,
     LightingConditionedTransformer,
@@ -40,6 +41,36 @@ def attention_bias_enabled(config: dict[str, Any]) -> bool:
     return bool(config["model"].get("lighting_attention_bias_enabled", True))
 
 
+def intrinsic_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolved AIN supervision settings; defaults match config validation."""
+    intrinsic = config.get("intrinsic") or {}
+    data_intrinsics = (config.get("data") or {}).get("intrinsics") or {}
+    latent_resolution = int(config["data"]["resolution"]) // 8
+    return {
+        "enabled": bool(intrinsic.get("enabled", False)),
+        "data_enabled": bool(data_intrinsics.get("enabled", False)),
+        "require": bool(data_intrinsics.get("require", False)),
+        "weight": float(intrinsic.get("weight", 0.1)),
+        "albedo_weight": float(intrinsic.get("albedo_weight", 1.0)),
+        "normal_weight": float(intrinsic.get("normal_weight", 1.0)),
+        "irradiance_weight": float(intrinsic.get("irradiance_weight", 1.0)),
+        "head_resolution": int(intrinsic.get("head_resolution", latent_resolution)),
+        "hidden_channels": int(intrinsic.get("hidden_channels", 256)),
+        "sigma_weight_power": float(intrinsic.get("sigma_weight_power", 1.0)),
+        "sigma_weight_tau": float(intrinsic.get("sigma_weight_tau", 1.0)),
+        "sigma_max": float(intrinsic.get("sigma_max", 1.0)),
+    }
+
+
+def ain_loss_weights(settings: dict[str, Any]) -> dict[str, float]:
+    """Per-term AIN weights (lambda) handed to :func:`intrinsic_losses`."""
+    return {
+        "albedo": float(settings["albedo_weight"]),
+        "normal": float(settings["normal_weight"]),
+        "irradiance": float(settings["irradiance_weight"]),
+    }
+
+
 def encode_vae(
     vae: torch.nn.Module,
     images: torch.Tensor,
@@ -61,6 +92,27 @@ def pack_latents(pipeline_class: type, latents: torch.Tensor) -> torch.Tensor:
         num_channels_latents=latents.shape[1],
         height=latents.shape[2],
         width=latents.shape[3],
+    )
+
+
+def unpack_latents(
+    pipeline_class: type,
+    latents: torch.Tensor,
+    resolution: int,
+    vae_scale_factor: int,
+) -> torch.Tensor:
+    """Undo FLUX 2x2 patch packing, e.g. packed ``[B, S, 64]`` -> ``[B, 16, 120, 120]``."""
+    unpack = getattr(pipeline_class, "_unpack_latents", None)
+    if unpack is None:
+        raise RuntimeError(
+            f"{pipeline_class.__name__} has no _unpack_latents; the AIN head needs an "
+            "unpacked VAE latent"
+        )
+    return unpack(
+        latents,
+        height=int(resolution),
+        width=int(resolution),
+        vae_scale_factor=int(vae_scale_factor),
     )
 
 
@@ -159,6 +211,7 @@ def prune_checkpoints(run_dir: Path, limit: int) -> None:
 def print_contract(config: dict[str, Any]) -> None:
     model_path = validate_model_snapshot(config["paths"]["pretrained_model"], require_exists=True)
     schema = LightingSchema(int(config["model"]["max_lights"]))
+    intrinsic = intrinsic_settings(config)
     print(
         json.dumps(
             {
@@ -179,6 +232,16 @@ def print_contract(config: dict[str, Any]) -> None:
                     config["model"].get("lighting_attention_mass", 0.05)
                 ),
                 "lighting_attention_bias_enabled": attention_bias_enabled(config),
+                "data_intrinsics_enabled": intrinsic["data_enabled"],
+                "data_intrinsics_require": intrinsic["require"],
+                "intrinsic_enabled": intrinsic["enabled"],
+                "intrinsic_weight": intrinsic["weight"],
+                "intrinsic_head_resolution": intrinsic["head_resolution"],
+                "intrinsic_hidden_channels": intrinsic["hidden_channels"],
+                "intrinsic_weights": ain_loss_weights(intrinsic),
+                "intrinsic_sigma_weight_power": intrinsic["sigma_weight_power"],
+                "intrinsic_sigma_weight_tau": intrinsic["sigma_weight_tau"],
+                "intrinsic_sigma_max": intrinsic["sigma_max"],
                 "composed_output_root": config["paths"].get("composed_output_root"),
                 "network_access": "disabled by local_files_only=True",
             },
@@ -192,6 +255,30 @@ def inspect_data(config: dict[str, Any]) -> None:
     for split in ("train", "validation"):
         dataset = TokenLightKontextDataset(config, split)
         sample = dataset[0]
+        intrinsic_summary: dict[str, Any] = {}
+        for name in (
+            "intrinsic_albedo",
+            "intrinsic_normal",
+            "intrinsic_irradiance",
+            "intrinsic_mask",
+        ):
+            if name not in sample:
+                continue
+            values = sample[name].float()
+            intrinsic_summary[name] = {
+                "shape": list(values.shape),
+                "min": float(values.min()),
+                "max": float(values.max()),
+                "mean": float(values.mean()),
+            }
+        if "intrinsic_normal" in sample and "intrinsic_mask" in sample:
+            length = sample["intrinsic_normal"].float().pow(2).sum(dim=0).sqrt()
+            valid = sample["intrinsic_mask"][0] > 0
+            if bool(valid.any()):
+                intrinsic_summary["normal_length_in_mask"] = [
+                    float(length[valid].min()),
+                    float(length[valid].max()),
+                ]
         print(
             json.dumps(
                 {
@@ -214,6 +301,9 @@ def inspect_data(config: dict[str, Any]) -> None:
                     "lighting_valid_count": int(sample["lighting_valid"].sum()),
                     "fixture_present": bool(sample["fixture_present"]),
                     "fixture_mask_pixels": float(sample["fixture_mask"].sum()),
+                    "intrinsics_enabled": dataset.intrinsics_enabled,
+                    "intrinsic_head_resolution": dataset.head_resolution,
+                    "intrinsic": intrinsic_summary,
                     "scene_id": sample["scene_id"],
                     "sample_seed": sample["sample_seed"],
                 },
@@ -314,10 +404,25 @@ def main() -> None:
             hidden_dim=int(config["model"]["fixture_mask_hidden_dim"]),
             stride=int(config["model"]["fixture_mask_stride"]),
         )
+    intrinsic_config = intrinsic_settings(config)
+    intrinsic_enabled = bool(intrinsic_config["enabled"])
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    latent_resolution = int(config["data"]["resolution"]) // vae_scale_factor
+    intrinsic_decoder = None
+    if intrinsic_enabled:
+        # The AIN head reads the unpacked VAE latent, so it needs the VAE latent
+        # channel count (16), not transformer.config.in_channels (64, packed).
+        intrinsic_decoder = IntrinsicDecoder(
+            latent_channels=int(vae.config.latent_channels),
+            latent_resolution=latent_resolution,
+            out_resolution=int(intrinsic_config["head_resolution"]),
+            hidden_channels=int(intrinsic_config["hidden_channels"]),
+        )
     model = LightingConditionedTransformer(
         transformer,
         lighting_encoder,
         fixture_mask_encoder,
+        intrinsic_decoder,
         ddp_trainable_only=True,
         lighting_attention_mass=float(config["model"].get("lighting_attention_mass", 0.05)),
         lighting_attention_bias_enabled=attention_bias_enabled(config),
@@ -343,9 +448,17 @@ def main() -> None:
         if fixture_mask_encoder is not None
         else 0
     )
+    intrinsic_parameter_count = (
+        sum(parameter.numel() for parameter in intrinsic_decoder.parameters())
+        if intrinsic_decoder is not None
+        else 0
+    )
     ddp_parameter_count = sum(parameter.numel() for parameter in model.parameters())
     expected_ddp_parameter_count = (
-        lora_parameter_count + lighting_parameter_count + fixture_mask_parameter_count
+        lora_parameter_count
+        + lighting_parameter_count
+        + fixture_mask_parameter_count
+        + intrinsic_parameter_count
     )
     if ddp_parameter_count != expected_ddp_parameter_count:
         raise RuntimeError(
@@ -364,6 +477,15 @@ def main() -> None:
     )
     dataset = TokenLightKontextDataset(config, "train")
     validation_dataset = TokenLightKontextDataset(config, "validation")
+    if intrinsic_enabled:
+        expected_head = int(intrinsic_config["head_resolution"])
+        for split_dataset in (dataset, validation_dataset):
+            if split_dataset.head_resolution != expected_head:
+                raise RuntimeError(
+                    "dataset and model disagree on intrinsic.head_resolution: "
+                    f"{split_dataset.split}={split_dataset.head_resolution}, "
+                    f"config={expected_head}"
+                )
     loader = DataLoader(
         dataset,
         batch_size=int(train_config["micro_batch_size"]),
@@ -407,6 +529,15 @@ def main() -> None:
                     fixture_state,
                     str(Path(path) / "fixture_mask_encoder.safetensors"),
                 )
+            if unwrapped.intrinsic_decoder is not None:
+                intrinsic_state = {
+                    key: value.detach().cpu().contiguous()
+                    for key, value in unwrapped.intrinsic_decoder.state_dict().items()
+                }
+                save_file(
+                    intrinsic_state,
+                    str(Path(path) / "intrinsic_decoder.safetensors"),
+                )
             (Path(path) / "lighting_config.json").write_text(
                 json.dumps(
                     {
@@ -426,6 +557,13 @@ def main() -> None:
                             config["model"].get("lighting_attention_mass", 0.05)
                         ),
                         "lighting_attention_bias_enabled": attention_bias_enabled(config),
+                        "intrinsic_enabled": intrinsic_decoder is not None,
+                        "intrinsic_head_resolution": int(
+                            intrinsic_config["head_resolution"]
+                        ),
+                        "intrinsic_hidden_channels": int(
+                            intrinsic_config["hidden_channels"]
+                        ),
                         "text_conditioning": False,
                     },
                     indent=2,
@@ -478,10 +616,58 @@ def main() -> None:
         # Checkpoints written before the bias switch existed always trained with
         # the bias enabled, so a missing key means true.
         metadata = {"lighting_attention_bias_enabled": True, **metadata}
+        # AIN keys are checked separately so that checkpoints written before the
+        # intrinsic head existed stay resumable while the head is disabled.
+        intrinsic_metadata = {
+            name: metadata.pop(name)
+            for name in (
+                "intrinsic_enabled",
+                "intrinsic_head_resolution",
+                "intrinsic_hidden_channels",
+            )
+            if name in metadata
+        }
         if metadata != expected_metadata:
             raise RuntimeError(
                 f"lighting checkpoint metadata mismatch: expected={expected_metadata}, actual={metadata}"
             )
+        checkpoint_has_intrinsic = bool(intrinsic_metadata.get("intrinsic_enabled", False))
+        if checkpoint_has_intrinsic != (intrinsic_decoder is not None):
+            raise RuntimeError(
+                "intrinsic_decoder presence differs between checkpoint "
+                f"({checkpoint_has_intrinsic}) and current config "
+                f"({intrinsic_decoder is not None}); start a new run instead of resuming"
+            )
+        if intrinsic_decoder is not None:
+            if int(intrinsic_metadata.get("intrinsic_head_resolution", -1)) != (
+                intrinsic_decoder.out_resolution
+            ):
+                raise RuntimeError(
+                    "intrinsic head resolution differs from checkpoint: "
+                    f"checkpoint={intrinsic_metadata.get('intrinsic_head_resolution')}, "
+                    f"config={intrinsic_decoder.out_resolution}"
+                )
+            if int(intrinsic_metadata.get("intrinsic_hidden_channels", -1)) != (
+                intrinsic_decoder.hidden_channels
+            ):
+                raise RuntimeError(
+                    "intrinsic hidden channels differ from checkpoint: "
+                    f"checkpoint={intrinsic_metadata.get('intrinsic_hidden_channels')}, "
+                    f"config={intrinsic_decoder.hidden_channels}"
+                )
+            intrinsic_path = Path(path) / "intrinsic_decoder.safetensors"
+            if not intrinsic_path.is_file():
+                raise FileNotFoundError(
+                    f"checkpoint has no intrinsic decoder: {intrinsic_path}"
+                )
+            missing, unexpected = model.intrinsic_decoder.load_state_dict(
+                load_file(str(intrinsic_path), device="cpu"), strict=True
+            )
+            if missing or unexpected:
+                raise RuntimeError(
+                    f"intrinsic decoder checkpoint mismatch: missing={missing}, "
+                    f"unexpected={unexpected}"
+                )
         missing, unexpected = model.lighting_encoder.load_state_dict(
             load_file(str(lighting_path), device="cpu"), strict=True
         )
@@ -511,6 +697,9 @@ def main() -> None:
     model, optimizer, loader, validation_loader = accelerator.prepare(
         model, optimizer, loader, validation_loader
     )
+    # The AIN head is invoked directly (it consumes the predicted clean latent,
+    # not the transformer forward), so it is resolved once from the DDP wrapper.
+    unwrapped = accelerator.unwrap_model(model)
     if accelerator.is_main_process:
         print(
             json.dumps(
@@ -520,6 +709,11 @@ def main() -> None:
                     "lora_parameter_count": lora_parameter_count,
                     "lighting_encoder_parameter_count": lighting_parameter_count,
                     "fixture_mask_encoder_parameter_count": fixture_mask_parameter_count,
+                    "intrinsic_decoder_parameter_count": intrinsic_parameter_count,
+                    "intrinsic_enabled": intrinsic_enabled,
+                    "intrinsic_head_resolution": int(intrinsic_config["head_resolution"]),
+                    "intrinsic_weight": float(intrinsic_config["weight"]),
+                    "latent_resolution": latent_resolution,
                     "frozen_backbone_parameter_count": sum(
                         parameter.numel()
                         for parameter in transformer.parameters()
@@ -602,9 +796,11 @@ def main() -> None:
         model.eval()
         transformer.eval()
         generator = torch.Generator(device=accelerator.device).manual_seed(validation_seed)
-        # total sum/count, one sum/count pair per task, then ablated-mask sum/count
+        # total sum/count, one sum/count pair per task, then ablated-mask
+        # sum/count, then one sum/count pair per AIN term.
+        intrinsic_stats_offset = 4 + 2 * len(validation_tasks)
         stats = torch.zeros(
-            4 + 2 * len(validation_tasks),
+            intrinsic_stats_offset + 6,
             device=accelerator.device,
             dtype=torch.float64,
         )
@@ -661,6 +857,11 @@ def main() -> None:
             sigmas = scheduler.sigmas[timestep_indices].to(
                 device=accelerator.device, dtype=clean_target.dtype
             ).view(-1, *([1] * (clean_target.ndim - 1)))
+            ain_weight = (
+                ain_timestep_weight(sigmas, intrinsic_config)
+                if intrinsic_enabled and "intrinsic_albedo" in validation_batch
+                else None
+            )
             noisy_target = (1.0 - sigmas) * clean_target + sigmas * noise
             hidden_states = torch.cat((noisy_target, condition), dim=1)
             image_ids = torch.cat((target_ids, condition_ids), dim=-2)
@@ -678,6 +879,7 @@ def main() -> None:
                 if accelerator.device.type == "cuda" and mixed_precision != "no"
                 else nullcontext()
             )
+            ain_terms: dict[str, float] | None = None
             with autocast:
                 prediction = model(
                     hidden_states=hidden_states,
@@ -698,6 +900,25 @@ def main() -> None:
                 prediction = prediction[:, : clean_target.shape[1]]
                 flow_target = noise - clean_target
                 sample_losses = (prediction.float() - flow_target.float()).square().flatten(1).mean(1)
+
+                if ain_weight is not None:
+                    # Same clean-latent estimate as training; float32 first so the
+                    # subtraction of two close bf16 values does not lose precision.
+                    clean_prediction = (
+                        noisy_target.float() - sigmas.float() * prediction.float()
+                    ).to(weight_dtype)
+                    clean_prediction = unpack_latents(
+                        FluxKontextPipeline,
+                        clean_prediction,
+                        resolution=int(config["data"]["resolution"]),
+                        vae_scale_factor=vae_scale_factor,
+                    )
+                    _, ain_terms = intrinsic_losses(
+                        unwrapped.intrinsic_decoder(clean_prediction),
+                        validation_batch,
+                        sample_weight=ain_weight,
+                        weights=ain_loss_weights(intrinsic_config),
+                    )
 
                 in_scene_indices = [
                     index
@@ -741,6 +962,21 @@ def main() -> None:
                 selected = ablated_losses[in_scene_indices]
                 stats[ablation_offset] += selected.double().sum()
                 stats[ablation_offset + 1] += selected.numel()
+            if ain_terms is not None:
+                ain_mask = validation_batch["intrinsic_mask"].float()
+                ain_mask = ain_mask * ain_weight.float().view(-1, 1, 1, 1)
+                denominator = ain_mask.sum().double()
+                terms = torch.tensor(
+                    [ain_terms["albedo"], ain_terms["normal"], ain_terms["irradiance"]],
+                    device=accelerator.device,
+                    dtype=torch.float64,
+                )
+                # Weight each batch mean by its valid-pixel count so the ratio of
+                # the sums below is the exact loss over every validation pixel.
+                stats[intrinsic_stats_offset : intrinsic_stats_offset + 6 : 2] += (
+                    terms * denominator
+                )
+                stats[intrinsic_stats_offset + 1 : intrinsic_stats_offset + 6 : 2] += denominator
 
         stats = accelerator.reduce(stats, reduction="sum")
         if stats[1].item() == 0:
@@ -763,6 +999,20 @@ def main() -> None:
                 metrics["validation/in_scene_mask_ablation_gap"] = (
                     ablated_loss - in_scene_loss
                 )
+        # AIN metrics are reported separately and never mixed into validation/loss,
+        # so best_checkpoint selection stays comparable with past runs.
+        intrinsic_values: dict[str, float] = {}
+        for term_index, name in enumerate(("albedo", "normal", "irradiance")):
+            offset = intrinsic_stats_offset + 2 * term_index
+            if stats[offset + 1].item() > 0:
+                intrinsic_values[name] = float((stats[offset] / stats[offset + 1]).item())
+        intrinsic_weights = ain_loss_weights(intrinsic_config)
+        for name, value in intrinsic_values.items():
+            metrics[f"validation/intrinsic_{name}"] = value
+        if len(intrinsic_values) == 3:
+            metrics["validation/intrinsic_total"] = sum(
+                intrinsic_weights[name] * intrinsic_values[name] for name in intrinsic_values
+            )
         accelerator.log(metrics, step=step)
         current_validation_loss = metrics["validation/loss"]
         is_best = current_validation_loss < best_validation_loss
@@ -773,6 +1023,11 @@ def main() -> None:
             progress_bar.write(
                 f"validation step={step} loss={metrics['validation/loss']:.6f} "
                 f"samples={int(stats[1].item())} best={is_best}"
+                + (
+                    f" ain={metrics['validation/intrinsic_total']:.5f}"
+                    if "validation/intrinsic_total" in metrics
+                    else ""
+                )
             )
         model.train()
         transformer.train()
@@ -851,6 +1106,11 @@ def main() -> None:
                 sigmas = scheduler.sigmas[timestep_indices].to(
                     device=accelerator.device, dtype=clean_target.dtype
                 ).view(-1, *([1] * (clean_target.ndim - 1)))
+                ain_weight = (
+                    ain_timestep_weight(sigmas, intrinsic_config)
+                    if intrinsic_enabled and "intrinsic_albedo" in batch
+                    else None
+                )
                 noisy_target = (1.0 - sigmas) * clean_target + sigmas * noise
                 hidden_states = torch.cat((noisy_target, condition), dim=1)
                 image_ids = torch.cat((target_ids, condition_ids), dim=-2)
@@ -888,7 +1148,30 @@ def main() -> None:
                     )[0]
                     prediction = prediction[:, : clean_target.shape[1]]
                     flow_target = noise - clean_target
-                    loss = torch.mean((prediction.float() - flow_target.float()) ** 2)
+                    flow_loss = torch.mean((prediction.float() - flow_target.float()) ** 2)
+
+                    loss = flow_loss
+                    ain_stats: dict[str, float] = {}
+                    if ain_weight is not None:
+                        # x0 = noisy - sigma * v_hat. Compute in float32 first:
+                        # subtracting two close bf16 values loses too much.
+                        clean_prediction = (
+                            noisy_target.float() - sigmas.float() * prediction.float()
+                        ).to(weight_dtype)
+                        clean_prediction = unpack_latents(
+                            FluxKontextPipeline,
+                            clean_prediction,
+                            resolution=int(config["data"]["resolution"]),
+                            vae_scale_factor=vae_scale_factor,
+                        )
+                        decoded = unwrapped.intrinsic_decoder(clean_prediction)
+                        ain_total, ain_stats = intrinsic_losses(
+                            decoded,
+                            batch,
+                            sample_weight=ain_weight,
+                            weights=ain_loss_weights(intrinsic_config),
+                        )
+                        loss = loss + float(intrinsic_config["weight"]) * ain_total
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -899,6 +1182,7 @@ def main() -> None:
             if accelerator.sync_gradients:
                 global_step += 1
                 mean_loss = accelerator.gather(loss.detach().reshape(1)).mean().item()
+                mean_flow_loss = accelerator.gather(flow_loss.detach().reshape(1)).mean().item()
                 mean_timestep = accelerator.gather(
                     (timesteps.detach().float() / 1000.0).reshape(-1)
                 ).mean().item()
@@ -911,11 +1195,37 @@ def main() -> None:
                 )
                 metrics = {
                     "train/loss": mean_loss,
+                    # Logged separately so the intrinsic run stays directly
+                    # comparable with the flow-only baseline.
+                    "train/flow_loss": mean_flow_loss,
                     "train/learning_rate": current_lr,
                     "train/grad_norm": grad_norm_value,
                     "train/timestep_mean": mean_timestep,
                     "train/sigma_mean": mean_sigma,
                 }
+                if ain_stats:
+                    ain_names = ("albedo", "normal", "irradiance", "total")
+                    gathered = accelerator.gather(
+                        torch.tensor(
+                            [ain_stats[name] for name in ain_names],
+                            device=accelerator.device,
+                        )
+                    ).reshape(-1, len(ain_names)).mean(dim=0)
+                    for name, value in zip(ain_names, gathered.tolist()):
+                        metrics[f"train/intrinsic_{name}"] = float(value)
+                    weight_stats = accelerator.gather(
+                        torch.tensor(
+                            [
+                                float(ain_weight.mean()),
+                                float(
+                                    (ain_weight * sigmas.detach().float().reshape(-1)).mean()
+                                ),
+                            ],
+                            device=accelerator.device,
+                        )
+                    ).reshape(-1, 2).mean(dim=0)
+                    metrics["train/ain_weight_mean"] = float(weight_stats[0])
+                    metrics["train/ain_weight_effective_mean"] = float(weight_stats[1])
                 if accelerator.device.type == "cuda":
                     metrics["system/max_memory_allocated_gib"] = (
                         torch.cuda.max_memory_allocated(accelerator.device) / (1024**3)
@@ -959,6 +1269,17 @@ def main() -> None:
                     "lora_parameters": lora_parameter_count,
                     "lighting_encoder_parameters": lighting_parameter_count,
                     "fixture_mask_encoder_parameters": fixture_mask_parameter_count,
+                    "intrinsic_decoder_parameters": intrinsic_parameter_count,
+                    "intrinsic_enabled": intrinsic_enabled,
+                    "intrinsic_weight": float(intrinsic_config["weight"]),
+                    "intrinsic_loss_weights": ain_loss_weights(intrinsic_config),
+                    "intrinsic_head_resolution": int(intrinsic_config["head_resolution"]),
+                    "intrinsic_hidden_channels": int(intrinsic_config["hidden_channels"]),
+                    "intrinsic_sigma_weight_power": float(
+                        intrinsic_config["sigma_weight_power"]
+                    ),
+                    "intrinsic_sigma_weight_tau": float(intrinsic_config["sigma_weight_tau"]),
+                    "intrinsic_sigma_max": float(intrinsic_config["sigma_max"]),
                     "ddp_parameters": ddp_parameter_count,
                     "ddp_mode": "trainable_parameters_only",
                     "world_size": accelerator.num_processes,

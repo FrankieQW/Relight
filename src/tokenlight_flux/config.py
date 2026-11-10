@@ -142,6 +142,57 @@ def _validate(config: dict[str, Any]) -> None:
         if int(config["train"].get(name, default)) < 1:
             raise ConfigError(f"train.{name} must be positive")
 
+    intrinsic_data = config["data"].get("intrinsics") or {}
+    if not isinstance(intrinsic_data, dict):
+        raise ConfigError("data.intrinsics must be a mapping")
+    for name in ("enabled", "require"):
+        if name in intrinsic_data and not isinstance(intrinsic_data[name], bool):
+            raise ConfigError(f"data.intrinsics.{name} must be a boolean")
+
+    intrinsic = config.get("intrinsic") or {}
+    if not isinstance(intrinsic, dict):
+        raise ConfigError("intrinsic must be a mapping")
+    if "enabled" in intrinsic and not isinstance(intrinsic["enabled"], bool):
+        raise ConfigError("intrinsic.enabled must be a boolean")
+    if bool(intrinsic.get("enabled", False)):
+        if not bool(intrinsic_data.get("enabled", False)):
+            # The loss would silently receive no targets otherwise.
+            raise ConfigError("intrinsic.enabled requires data.intrinsics.enabled")
+        head = int(intrinsic.get("head_resolution", resolution // 8))
+        if head < 16:
+            raise ConfigError("intrinsic.head_resolution must be >= 16")
+        if resolution % head:
+            raise ConfigError(
+                f"data.resolution ({resolution}) must be a multiple of "
+                f"intrinsic.head_resolution ({head})"
+            )
+        # The decoder maps the VAE latent grid (resolution / 8) to the supervision
+        # grid with a single exact resample, so the two must divide one another.
+        # This admits the documented 60 / 120 / 240 targets; a value such as 100
+        # satisfies neither direction and is rejected here.
+        latent_resolution = resolution // 8
+        if head % latent_resolution and latent_resolution % head:
+            raise ConfigError(
+                f"intrinsic.head_resolution ({head}) must be an integer multiple or "
+                f"divisor of the latent resolution ({latent_resolution})"
+            )
+        hidden_channels = int(intrinsic.get("hidden_channels", 256))
+        if hidden_channels < 8 or hidden_channels % 8:
+            # GroupNorm(8, C) in the decoder head requires a multiple of 8.
+            raise ConfigError("intrinsic.hidden_channels must be >= 8 and a multiple of 8")
+        if float(intrinsic.get("weight", 0.0)) < 0:
+            raise ConfigError("intrinsic.weight cannot be negative")
+        for name in ("albedo_weight", "normal_weight", "irradiance_weight"):
+            if float(intrinsic.get(name, 1.0)) < 0:
+                raise ConfigError(f"intrinsic.{name} cannot be negative")
+        power = float(intrinsic.get("sigma_weight_power", 1.0))
+        tau = float(intrinsic.get("sigma_weight_tau", 1.0))
+        sigma_max = float(intrinsic.get("sigma_max", 1.0))
+        if power < 0 or tau <= 0:
+            raise ConfigError("intrinsic.sigma_weight_power must be >= 0 and tau > 0")
+        if not 0.0 < sigma_max <= 1.0:
+            raise ConfigError("intrinsic.sigma_max must be in (0, 1]")
+
 
 def validate_model_snapshot(path_value: str | Path, require_exists: bool = True) -> Path:
     model_path = Path(path_value).expanduser()

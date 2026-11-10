@@ -39,6 +39,7 @@ new_method/
 │   ├── __init__.py
 │   ├── config.py
 │   ├── dataset.py
+│   ├── intrinsics.py
 │   ├── lighting.py
 │   ├── train.py
 │   └── infer.py
@@ -205,7 +206,8 @@ pip install -e .
 - 8 卡 global batch = `1 × 4 × 8 = 32`；
 - gradient checkpointing 默认关闭（显存不足时可在配置中开启）；
 - 每 500 optimizer steps 保存 checkpoint；
-- attention logits bias 默认开启（`model.lighting_attention_bias_enabled: true`）。
+- attention logits bias 默认开启（`model.lighting_attention_bias_enabled: true`）；
+- AIN 内在量监督默认开启（`intrinsic.enabled: true`，见 §12）。
 
 `model.lighting_attention_bias_enabled: false` 时不再安装自定义 attention processor，
 lighting token 只参与普通 joint attention，不施加
@@ -242,6 +244,7 @@ CUDA_DEVICES=0 NUM_PROCESSES=1 \
 pytorch_lora_weights.safetensors
 lighting_encoder.safetensors
 fixture_mask_encoder.safetensors
+intrinsic_decoder.safetensors      # 仅当 intrinsic.enabled: true
 lighting_config.json
 optimizer/state/RNG files written by Accelerate
 ```
@@ -317,12 +320,24 @@ schema、Fourier 设置、context dimension 和权重 shape。
 
 ```text
 train/loss
+train/flow_loss
 train/learning_rate
 train/grad_norm
 train/timestep_mean
 train/sigma_mean
 system/max_memory_allocated_gib
 system/max_memory_reserved_gib
+```
+
+启用 AIN 监督后额外记录（`train/flow_loss` 便于与旧 baseline 直接对比）：
+
+```text
+train/intrinsic_albedo
+train/intrinsic_normal
+train/intrinsic_irradiance
+train/intrinsic_total
+train/ain_weight_mean
+train/ain_weight_effective_mean
 ```
 
 另开终端启动 TensorBoard：
@@ -351,6 +366,11 @@ TensorBoard 会记录 `validation/loss` 和四种任务各自的 validation loss
 启用 fixture mask 后还会记录 `validation/in_scene_mask_ablated_loss` 和
 `validation/in_scene_mask_ablation_gap`。后者等于“零 mask 损失减正确 mask 损失”；持续
 大于 0 才说明模型确实利用了 mask 空间条件。
+
+启用 AIN 监督后另记 `validation/intrinsic_albedo`、`validation/intrinsic_normal`、
+`validation/intrinsic_irradiance` 和 `validation/intrinsic_total`。这些指标**不并入**
+`validation/loss`，`best_checkpoint` 仍按 `validation/loss` 选择，以保持与历史
+`best_validation.json` 可比。
 
 当 `validation/loss` 严格低于历史最佳值时，训练会更新：
 
@@ -461,7 +481,53 @@ loss = MSE(prediction, noise - clean_target_latent)
 loss 只在 target image token 部分计算。LightingTokenEncoder 和 LoRA 同时接收梯度；冻结的
 FLUX 主干和 VAE 不更新。CLIP/T5 不参与前向计算。
 
-## 12. 验收边界
+## 12. AIN 内在量监督（albedo / irradiance / normal）
+
+同一次 DiT 前向产生两条输出：velocity 用于 flow-matching，`x0 = noisy − σ·v̂` 经
+`_unpack_latents` 还原成 `[B,16,120,120]` 后送进 `IntrinsicDecoder` 解出 albedo /
+normal / irradiance 三张图。不引入第二次 transformer 前向。
+
+```text
+L_total = L_flow + ω · ( λ_A·L_albedo + λ_N·L_normal + λ_I·L_irradiance )
+m       = valid_mask · w(σ),   w(σ) = clamp((1-σ)/τ, 0, 1) ** p
+```
+
+- `L_flow` 完全未改，仍是不带掩码、不带时间步权重的全 token MSE；
+- `L_albedo`、`L_irradiance` 是对 `sigmoid(head)` 的 L1；`L_normal` 是 `1 − cos`；
+- 三项的分母都是加权后的有效像素总数（不是权重之和）。
+
+数据侧要求每条 scene metadata 带 `passes` 块（`albedo` / `normal_camera` / `valid_mask`
+/ `irradiance` 索引）。`data.intrinsics.require: true` 时缺 `passes` 会直接报错：旧数据集
+（例如 `other/sample/metadata.json`）没有该块，必须换用以 `passes.enabled: true` 重渲的
+数据集。
+
+关键配置：
+
+```yaml
+data:
+  intrinsics: {enabled: true, require: true}
+intrinsic:
+  enabled: true
+  weight: 0.1            # ω
+  albedo_weight: 1.0     # λ_A
+  normal_weight: 1.0     # λ_N
+  irradiance_weight: 1.0 # λ_I
+  head_resolution: 120   # 60 / 120 / 240；须与 VAE latent 网格整除
+  hidden_channels: 256
+  sigma_weight_power: 1.0
+  sigma_weight_tau: 1.0
+  sigma_max: 1.0
+```
+
+`intrinsic.enabled: false` 是安全网：dataset 不返回任何 `intrinsic_*` 键、不构建 decoder、
+训练循环跳过全部新代码，`L_total == L_flow`，与开启前的实现逐字节等价。启用后
+`run_name` 必须换新，因为旧 checkpoint 没有 `intrinsic_decoder.safetensors`，
+`load_hook` 会用严格校验拒绝续训。
+
+`python precompose.py` 导出 composed 样本时，额外写出 `intrinsic_albedo.png` /
+`intrinsic_normal.png` / `intrinsic_irradiance.png` 供人工检查；它们不进训练。
+
+## 13. 验收边界
 
 当前工作区没有运行服务器 Python、GPU 或真实权重检查。正式训练前必须依次通过：
 
