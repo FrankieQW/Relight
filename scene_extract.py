@@ -61,7 +61,10 @@ def prepare_scenes(
     if not fbx_files:
         raise FileNotFoundError(f"No FBX files found under {scene_root}")
 
-    script_path = config.root / "datacompose" / "blender" / "entry.py"
+    # Resolve the Blender worker from this package, never from the config root:
+    # the project directory may be renamed or live anywhere, and `config.root`
+    # is free to point at an external data directory.
+    script_path = Path(__file__).resolve().parent / "blender" / "entry.py"
     if not script_path.exists():
         raise FileNotFoundError(script_path)
 

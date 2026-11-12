@@ -1,8 +1,9 @@
 # datacompose 数据合成指南
 
-本目录是 LightConstruction 的**数据合成**代码集合（可独立复制运行的 compose 项目）：把 Objaverse 单物体
-资产放进或替换到 Bistro 场景里，渲染出 TokenLight 需要的线性光照分量与 manifest。坐标约定与本目录内
-`transfer.py` 完全一致，并在此基础上补齐了**相机坐标系下的图像平面坐标与深度**。
+本目录是 LightConstruction 的**纯场景数据合成**代码集合（可独立复制运行的 compose 项目）：在已有场景
+（Bistro 等 FBX）里规划相机、施加可控光照，渲染出 TokenLight 需要的线性光照分量与 manifest。
+**不再插入 Objaverse 物体**，也没有物体/场景的语义配对；一个样本是 `(scene, camera pose, lighting)`。
+坐标约定与本目录内 `transfer.py` 完全一致，并在此基础上补齐了**相机坐标系下的图像平面坐标与深度**。
 
 - 参考实现：本目录 `transfer.py`（纯标准库，作为坐标约定的权威脚本）。
 - 模块化实现：`datacompose/coordinates.py`（本包内，供流水线和测试直接导入，并多写 `image_plane`）。
@@ -19,74 +20,79 @@ datacompose/
 ├── README.md                   独立项目快速上手
 ├── __init__.py                 __version__
 ├── __main__.py                 python -m datacompose
-├── cli.py                      M1–M4 统一入口
+├── _launcher.py                脚本启动器：包名注册 + 缺省 --config
+├── cli.py                      M1–M4 统一入口（依赖惰性导入）
+├── prepare_objects.py          python prepare_objects.py        → prepare-objects
+├── prepare_scenes.py           python prepare_scenes.py         → prepare-scenes
+├── annotate_construction.py    python annotate_construction.py  → annotate-construction
+├── prepare_geometry.py         python prepare_geometry.py       → prepare-geometry
+├── build_render_jobs.py        python build_render_jobs.py      → build-render-jobs
+├── render_dataset.py           python render_dataset.py         → render
+├── clear_render_partial.py     python clear_render_partial.py   → clear-render-partial
+├── plan_scene_cameras.py       python plan_scene_cameras.py     → plan-scene-cameras
 ├── config.py                   YAML 配置与项目根解析
 ├── coordinates.py              相机坐标 / 图像平面 / 深度（transfer.py 的模块版 + 扩展）
 ├── intrinsic.py                物理表征通道推导（albedo / irradiance / normal，纯 NumPy）
 ├── io_utils.py                 原子写、digest、JSONL
-├── schemas.py                  Pydantic 数据协议
+├── schemas.py                  Pydantic 数据协议（场景 + 相机 job）
 ├── scene_semantics.py          类别归一化与别名
-├── object_index.py             prepare-objects
+├── scene_cameras.py            场景内无碰撞相机采样（AABB 宽相 + 视野无穿插判据）
 ├── scene_extract.py            prepare-scenes（调用 blender/entry.py）
-├── llm_annotate.py             annotate-construction（vLLM）
-├── geometry_prepare.py         prepare-geometry
-├── render_jobs.py              build-render-jobs
-├── render_compositions.py      render（调度 blender/render_composition.py）
+├── render_scenes.py            render（多 GPU worker 调度 blender/render_scene.py）
 ├── render_recovery.py          渲染 partial 的清理与恢复
 ├── transfer.py                 坐标约定权威参考实现（纯标准库）
 ├── configs/
 │   ├── default.yaml            项目配置（project.root=.. 指向本目录）
 │   ├── category_aliases.yaml
-│   ├── category_dimensions.yaml
-│   ├── object_overrides.yaml
 │   └── scene_overrides.yaml
 ├── blender/
 │   ├── entry.py                FBX 导入、归一化、稳定 ID、scene fragment
-│   └── render_composition.py   组合放置/替换、相机与灯光选择、分量渲染、metadata
+│   └── render_scene.py         相机位姿精确复核、光照、分量渲染、metadata
 ├── tokenlight/
-│   ├── render_assets.py        Blender 侧渲染工具（供 render_composition.py 动态加载）
-│   ├── build_manifests.py      components → train/validation/test.jsonl（含 split 隔离）
-│   └── validate_components.py  分量、组合契约与坐标约定校验
+│   ├── render_assets.py        Blender 侧渲染工具（供 render_scene.py 动态加载）
+│   ├── build_manifests.py      components → train/validation/test.jsonl（按 scene 切分）
+│   └── validate_components.py  分量完整性与坐标约定校验
+├── scripts/
+│   └── remove_legacy_object_pipeline.sh   清理 object 时代残留文件
+├── tools/
+│   └── bench_scene_cameras.py  相机搜索成本基准
+├── docs/
+│   └── scene_only_render_feasibility.md   纯场景合成可行性方案
 └── tests/
     ├── test_coordinates.py
     ├── test_intrinsic_passes.py
     ├── test_manifest_camera.py
-    ├── test_composition_validator.py
-    ├── test_geometry_prepare.py
-    ├── test_render_compositions.py
-    ├── test_render_jobs.py
     ├── test_render_recovery.py
-    └── blender_composition_focus.py
+    ├── test_launcher.py
+    └── test_scene_cameras.py
 ```
 
 本目录是**独立可复制的 compose 项目**：只依赖自身代码与本目录下的 `configs/`、`transfer.py`，
-不引用上级仓库的 `src/`、`scripts/`、`Lumina-T2X/`。数据（Objaverse 资产、Bistro 场景）与训练侧
-由外部提供，通过 `--config` 的数据路径或环境变量接入；原 `stage2`（训练编排）已移出本项目。
+不引用上级仓库的 `src/`、`scripts/`、`Lumina-T2X/`。场景数据（Bistro 等 FBX）与训练侧
+由外部提供，通过 `--config` 的数据路径接入；原 `stage2`（训练编排）已移出本项目。
 
 ---
 
 ## 2. 数据流
 
 ```text
-data/object/object.json ─┐
-data/scene/scene.json ───┼─ annotate-construction ─→ annotation_construction.json
-                         │                                  │
-                         ├── prepare-geometry ─→ prepared_geometry.json
-                         │                                  │
-                         └── build-render-jobs ─→ render_jobs.jsonl
-                                                        │
-                                     render（Blender 组合 + 渲染）
-                                                        │
+data/scene/scene.json ── plan-scene-cameras ─→ scene_camera_jobs.jsonl
+                                                      │
+                                      render（Blender：位姿复核 + 渲染）
+                                                      │
               components/<job_id>/{ambient,dark,point_lights,diffuse,in_scene_lights}.exr
               components/<job_id>/metadata.json      ← canonical + world 坐标在这里落盘
-                                                        │
-                          build_manifests → validate_components → inspect_dataset
-                                                        │
+                                                      │
+                          build_manifests → validate_components
+                                                      │
               manifests/{train,validation,test}.jsonl  ← 写入 camera_position / image_plane
 ```
 
-一个 render job 是 `(scene, object, place|replace, target_entity, seed)`。每个 job 都从只读 base
+一个 render job 是 `(scene, camera pose, lighting profile, seed)`，与物体无关。每个 job 都从只读 base
 `.blend` 重新打开，渲染完回滚，不把上一个样本的状态带进下一个。
+
+相机位姿由 `scene_cameras.py` 规划（AABB 宽相），再由 `blender/render_scene.py` 用真实三角面复核：
+穿过几何体、贴脸、只对着一面墙、深度过平都会让这个 job 直接失败，而不是产出一张坏图。
 
 渲染产物里的 `position` 是 canonical 坐标系；训练需要的 OpenCV 相机坐标由 `build_manifests.py` 在
 生成本文件时写入 `camera_position`，因此 **manifest 才是训练该读的那份数据**，`components/*/metadata.json`
@@ -101,7 +107,7 @@ data/scene/scene.json ───┼─ annotate-construction ─→ annotation_co
 | 名称 | 轴向 | 原点 | 单位 | 谁写入 |
 |---|---|---|---|---|
 | Blender world | 右手，`+Z` 向上 | 场景世界原点 | 米 | Blender |
-| canonical | `x=right, y=camera-forward, z=up` | `camera.target` | 米 | `render_composition.py` |
+| canonical | `x=right, y=camera-forward, z=up` | `camera.target` | 米 | `render_scene.py` |
 | camera（OpenCV） | `X=right, Y=down, Z=forward` | `camera.location` | 米 | `transfer.py` / `coordinates.py` |
 | image plane | `u` 向右、`v` 向下 | 图像左上角像素 | 像素 | `coordinates.py` |
 
@@ -123,7 +129,7 @@ up      = normalize(cross(right, forward))
 distance = |target - location|
 ```
 
-`render_composition.py` 用 `_world_to_canonical()` 把灯光世界坐标写进 `position`，随后 `transfer.py`
+`render_scene.py` 用 `_world_to_canonical()` 把灯光世界坐标写进 `position`，随后 `transfer.py`
 或 `coordinates.py` 负责换算。渲染器还会把 `rotation_euler` 写进 manifest，转换器据此校验保存的相机
 确实是“对准 target、无 roll”，避免用错公式却不报错。
 
@@ -298,10 +304,10 @@ manifest 或外部工具自行恢复。`focal_length` 与 `sensor_width` 只是 
 }
 ```
 
-`validate_components.py` 会检查 `canonical.position_axes` 是否等于约定值；在
-`require_composition_contract: true`（正式数据路径固定开启）下，还会要求每个
-`point_lights` 与 `in_scene_lights` 都带 `camera_position`，并校验它与 `position` 的换算结果一致，
-缺失或不一致的 manifest 会被数据门直接拒绝。
+`validate_components.py` 会检查 `canonical.position_axes` 是否等于约定值，要求每个
+`point_lights` 与 `in_scene_lights` 都能换算出一致的相机坐标（`coordinates.convert_row()` 内部交叉
+校验 `position` 与 `renderer_position`），缺失或不一致的 manifest 会被数据门直接拒绝；同时它检查
+分量文件存在且非空、`camera` 带内参、以及同一个 `scene_id` 不跨 split。
 
 `build_manifests.py` 会在 `dataset_release.json` 写入
 `camera_position: {axes, depth, rows_with_image_plane_pixels}`，用于确认这一批数据确实带了训练坐标、
@@ -364,22 +370,46 @@ python -m datacompose.coordinates old_manifests new_manifests --allow-missing-in
 
 ## 6. 运行
 
+推荐用**同名脚本**直接跑，不需要 `python -m`，也不需要站在特定目录（脚本自己解析包位置）：
+
 ```bash
-# 在 datacompose 的“上一级目录”运行（即包含 datacompose/ 的目录），
-# 或 pip install -e 后从任意目录运行。--config 默认即 datacompose/configs/default.yaml。
-python -m datacompose.cli prepare-objects
-python -m datacompose.cli prepare-scenes       --blender-bin /opt/blender-4.5/blender
-python -m datacompose.cli annotate-construction --base-url http://127.0.0.1:8000/v1
-python -m datacompose.cli prepare-geometry
-python -m datacompose.cli build-render-jobs
-python -m datacompose.cli render               --blender-bin /opt/blender-4.5/blender
-python -m datacompose.cli clear-render-partial --job-id <job_id>
+conda activate <env>
+cd <本项目目录>              # 包含 prepare_scenes.py 等脚本的目录
+
+python prepare_scenes.py       --blender-bin /opt/blender-4.5/blender
+python plan_scene_cameras.py   --cameras-per-scene 32
+python render_dataset.py       --blender-bin /opt/blender-4.5/blender
+python clear_render_partial.py --job-id <job_id>
 ```
 
-Blender 侧的调用路径由 `scene_extract.py` 和 `render_compositions.py` 从**包自身位置**解析
+脚本与 CLI 子命令一一对应，参数完全一致：
+
+| 脚本 | 等价 CLI |
+|---|---|
+| `prepare_scenes.py` | `python -m datacompose.cli prepare-scenes` |
+| `plan_scene_cameras.py` | `... plan-scene-cameras` |
+| `render_dataset.py` | `... render` |
+| `clear_render_partial.py` | `... clear-render-partial` |
+
+脚本的实现只有三行（`from _launcher import run` → `run("<command>")`），`_launcher.py` 负责两件事：
+
+1. **把本目录按规范名 `datacompose` 注册进 `sys.modules`**，所以项目目录被改名（例如
+   `datacompose-sceneonly`）或从任意工作目录启动都能 import；`blender/entry.py` 在 Blender 内部
+   也做同样的注册。
+2. **缺省 `--config`**：命令行没给时用环境变量 `DATACOMPOSE_CONFIG`，再退回 `configs/default.yaml`。
+
+```bash
+export DATACOMPOSE_CONFIG=/data/frankie/datacompose-sceneonly/sceneonly.yaml
+python prepare_scenes.py --blender-bin /opt/blender-4.5/blender   # 不必再写 --config
+```
+
+`python -m datacompose.cli <command>` 仍然保留（要求当前目录是包的上一级），适合被别的脚本调用。
+`cli.py` 的第三方依赖是**按命令惰性导入**的：`--help` 与 `prepare-scenes` 不需要渲染/LLM 依赖。
+
+Blender 侧的调用路径由 `scene_extract.py` 和 `render_scenes.py` 从**包自身位置**解析
 （`datacompose/blender/*.py`），不依赖 `config.root`，因此可从任意工作目录启动 Blender。
-数据与输出路径由 config 的 `paths`（相对 `project.root`）决定，默认落在本目录内，可用自定义
-`--config` 指向外部数据目录。
+数据与输出路径由 config 的 `paths`（相对 `project.root`）决定；`paths.scene_cache` 必须位于
+`project.root` 之内，因为场景片段会以相对路径回写。
 
 训练/编排（原 stage2，依赖 Lumina-T2X）已不在本独立 compose 项目内，请在本目录之外单独进行。
 
@@ -390,6 +420,11 @@ Blender 侧的调用路径由 `scene_extract.py` 和 `render_compositions.py` �
 ```bash
 python -m unittest discover -s datacompose/tests -p 'test_*.py'
 ```
+
+`tests/test_launcher.py` 覆盖脚本化运行方式：包目录被改名后仍能按 `datacompose` 导入、
+`DATACOMPOSE_CONFIG` 与 `--config` 的优先级、以及 `plan-scene-cameras` 的端到端产出。
+`tests/test_scene_cameras.py` 覆盖场景相机判据（相机在几何体内 / 近裁剪穿插 / 单一平面糊屏 /
+深度跨度、确定性、与 `coordinates` 契约的一致性）。
 
 坐标相关的检查集中在 `datacompose/tests/test_coordinates.py`：
 
@@ -402,12 +437,6 @@ python -m unittest discover -s datacompose/tests -p 'test_*.py'
 - 镜头平移只改变主点，不改变焦距；
 - 目录转换是原子的，且默认拒绝覆盖。
 
-Blender 侧另有 `datacompose/tests/blender_composition_focus.py`，用真实相机验证取景、遮挡与灯具可见性：
-
-```bash
-/opt/blender-4.5/blender --background --factory-startup --python datacompose/tests/blender_composition_focus.py
-```
-
 ---
 
 ## 8. 与旧路径的映射
@@ -417,7 +446,7 @@ Blender 侧另有 `datacompose/tests/blender_composition_focus.py`，用真实�
 | `src/lightconstruction/*.py` | `datacompose/*.py` |
 | `src/lightconstruction/cli.py` | `datacompose/cli.py` |
 | `scripts/blender_entry.py` | `datacompose/blender/entry.py` |
-| `scripts/blender_render_composition.py` | `datacompose/blender/render_composition.py` |
+| `scripts/blender_render_composition.py` | `datacompose/blender/render_scene.py`（已改为纯场景渲染） |
 | `Lumina-T2X/tools/tokenlight_data/render_assets.py` | `datacompose/tokenlight/render_assets.py` |
 | `Lumina-T2X/tools/tokenlight_data/build_manifests.py` | `datacompose/tokenlight/build_manifests.py` |
 | `Lumina-T2X/tools/tokenlight_data/validate_components.py` | `datacompose/tokenlight/validate_components.py` |
@@ -431,7 +460,11 @@ Blender 侧另有 `datacompose/tests/blender_composition_focus.py`，用真实�
 版本，多写 `image_plane`，其余数值行为与它一致。
 
 > 训练/编排相关的旧 `scripts/stage2_config.py`、`scripts/run_stage2.sh`、`stage2.env.example`
-> 已移出本独立 compose 项目（本项目只做数据合成 M1–M4）。
+> 已移出本独立 compose 项目（本项目只做数据合成）。
+>
+> 纯场景改造同时移除了 object/标注/组合链路（`object_index`、`geometry_prepare`、`llm_annotate`、
+> `render_jobs`、`render_compositions`、`blender/render_composition`）。若某个 checkout 里还有这些
+> 文件残留，用 `bash scripts/remove_legacy_object_pipeline.sh --apply` 清理。
 
 ---
 

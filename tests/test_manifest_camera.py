@@ -9,14 +9,12 @@ import unittest
 
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from datacompose import coordinates  # noqa: E402
-
-
-ROOT = Path(__file__).resolve().parents[1]  # the datacompose package directory
 
 
 def load_script(relative: str, name: str):
@@ -28,18 +26,19 @@ def load_script(relative: str, name: str):
     return module
 
 
-def metadata_row() -> dict:
-    """One composition metadata document as the Blender renderer writes it."""
+def metadata_row(job_id: str = "job_1", scene_id: str = "bistro_interior") -> dict:
+    """One scene-only metadata document as ``blender/render_scene.py`` writes it."""
     return {
         "schema_version": "1.0",
-        "id": "job_1",
-        "asset_uid": "uid-1",
-        "asset": "objects/uid-1.glb",
-        "ambient": "components/job_1/ambient.exr",
-        "dark": "components/job_1/dark.exr",
+        "id": job_id,
+        "scene_id": scene_id,
+        "base_scene_blend": f"data/cache/scenes/{scene_id}.blend",
+        "base_scene_digest": "sha256:" + "1" * 64,
+        "ambient": f"components/{job_id}/ambient.exr",
+        "dark": f"components/{job_id}/dark.exr",
         "point_lights": [
             {
-                "path": "components/job_1/point_lights/light_000.exr",
+                "path": f"components/{job_id}/point_lights/light_000.exr",
                 "position": [2.0, 3.0, 1.0],
                 "renderer_position": [2.0, 3.0, 1.0],
                 "base_energy": 100.0,
@@ -47,13 +46,13 @@ def metadata_row() -> dict:
             }
         ],
         "diffuse": [
-            {"path": "components/job_1/diffuse/spread_00.exr", "level": 0.0, "size": 0.05},
-            {"path": "components/job_1/diffuse/spread_05.exr", "level": 1.0, "size": 1.5},
+            {"path": f"components/{job_id}/diffuse/spread_00.exr", "level": 0.0, "size": 0.05},
+            {"path": f"components/{job_id}/diffuse/spread_05.exr", "level": 1.0, "size": 1.5},
         ],
         "in_scene_lights": [
             {
-                "path": "components/job_1/in_scene_lights/fixture_000_on.exr",
-                "mask": "components/job_1/in_scene_lights/fixture_000_mask.png",
+                "path": f"components/{job_id}/in_scene_lights/fixture_000_on.exr",
+                "mask": f"components/{job_id}/in_scene_lights/fixture_000_mask.png",
                 "position": [0.0, 0.0, 0.0],
                 "renderer_position": [0.0, 0.0, 0.0],
                 "base_energy": 50.0,
@@ -87,60 +86,46 @@ def metadata_row() -> dict:
             "position_axes": "x=right,y=camera-forward,z=up",
             "units": "meter",
         },
-        "composition": {"relation": "place"},
-        "base_scene_id": "bistro_interior",
-        "lineage": {"render_job_digest": "sha256:deadbeef"},
+        "lineage": {"scene_camera_digest": "sha256:deadbeef"},
         "license": {"decision": "allowed", "policy_version": "operator-policy-v1"},
     }
 
 
-class ManifestCameraCoordinateTest(unittest.TestCase):
-    """build_manifests must ship OpenCV camera coordinates for training."""
+def write_stage2_config(root: Path) -> Path:
+    config_path = root / "stage2.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "paths": {"render_output_root": str(root), "dataset_root": str(root)},
+                "data": {"split_profile": "scene-held-out"},
+                "render": {
+                    "train_fraction": 0.34,
+                    "validation_fraction": 0.33,
+                    "test_fraction": 0.33,
+                    "split_seed": 7,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config_path
 
-    def test_manifests_carry_camera_position_and_image_plane(self) -> None:
+
+class SceneManifestTest(unittest.TestCase):
+    """build_manifests must ship OpenCV camera coordinates, split by scene."""
+
+    def test_manifests_carry_camera_position_and_split_by_scene(self) -> None:
         builder = load_script("tokenlight/build_manifests.py", "build_manifests_test")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            component = root / "components" / "job_1"
-            component.mkdir(parents=True)
-            (component / "metadata.json").write_text(
-                json.dumps(metadata_row()), encoding="utf-8"
-            )
-            jobs = root / "render_jobs.jsonl"
-            jobs.write_text(
-                json.dumps(
-                    {
-                        "job_id": "job_1",
-                        "object_uid": "uid-1",
-                        "base_scene_id": "bistro_interior",
-                        "lineage": {"render_job_digest": "sha256:deadbeef"},
-                    }
+            for index, scene in enumerate(("bistro_interior", "bistro_exterior", "bistro_wine")):
+                component = root / "components" / f"job_{index}"
+                component.mkdir(parents=True)
+                (component / "metadata.json").write_text(
+                    json.dumps(metadata_row(f"job_{index}", scene)), encoding="utf-8"
                 )
-                + "\n",
-                encoding="utf-8",
-            )
-            config_path = root / "config.yaml"
-            config_path.write_text(
-                yaml.safe_dump(
-                    {
-                        "paths": {
-                            "render_output_root": str(root),
-                            "render_jobs_manifest": str(jobs),
-                        },
-                        "data": {
-                            "split_profile": "object-held-out",
-                            "require_composition_contract": True,
-                        },
-                        "render": {
-                            "train_fraction": 0.7,
-                            "validation_fraction": 0.2,
-                            "test_fraction": 0.1,
-                            "split_seed": 7,
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
+            config_path = write_stage2_config(root)
+
             previous = sys.argv
             sys.argv = ["build_manifests.py", "--config", str(config_path)]
             try:
@@ -148,16 +133,39 @@ class ManifestCameraCoordinateTest(unittest.TestCase):
             finally:
                 sys.argv = previous
 
-            row = json.loads(
-                (root / "manifests" / "train.jsonl").read_text(encoding="utf-8").strip()
-            )
+            rows = []
+            for split in ("train", "validation", "test"):
+                path = root / "manifests" / f"{split}.jsonl"
+                if path.is_file():
+                    rows.extend(
+                        json.loads(line)
+                        for line in path.read_text(encoding="utf-8").splitlines()
+                        if line
+                    )
+            self.assertEqual(len(rows), 3)
+            # A scene must never be split across manifests.
+            by_scene: dict[str, set[str]] = {}
+            for split in ("train", "validation", "test"):
+                path = root / "manifests" / f"{split}.jsonl"
+                if not path.is_file():
+                    continue
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if line:
+                        by_scene.setdefault(json.loads(line)["scene_id"], set()).add(split)
+            self.assertTrue(all(len(splits) == 1 for splits in by_scene.values()), by_scene)
+
+            row = rows[0]
             light = row["point_lights"][0]
             self.assertEqual(light["position"], [2.0, 3.0, 1.0])
             self.assertEqual(light["camera_position"], [2.0, -1.0, 13.0])
             self.assertEqual(light["image_plane"]["depth"], 13.0)
             self.assertAlmostEqual(light["image_plane"]["u"], 512.0 * 2.0 / 13.0 + 512.0)
             self.assertEqual(row["camera_position_convention"]["axes"], "x=right,y=down,z=forward")
+
             release = json.loads((root / "dataset_release.json").read_text(encoding="utf-8"))
+            self.assertEqual(release["split_profile"], "scene-held-out")
+            self.assertEqual(release["counts"]["train"] + release["counts"]["validation"] + release["counts"]["test"], 3)
+            self.assertEqual(release["scenes"], {split: 1 for split in ("train", "validation", "test")})
             self.assertEqual(release["camera_position"]["axes"], "x=right,y=down,z=forward")
             self.assertEqual(release["camera_position"]["rows_with_image_plane_pixels"], 1)
 
@@ -181,52 +189,17 @@ class ManifestCameraCoordinateTest(unittest.TestCase):
             },
             "irradiance": {"ambient": "components/job_1/passes/irradiance/ambient.exr"},
         }
-        row = metadata_row()
-        row["passes"] = passes
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            component = root / "components" / "job_1"
-            component.mkdir(parents=True)
-            (component / "metadata.json").write_text(json.dumps(row), encoding="utf-8")
-            jobs = root / "render_jobs.jsonl"
-            jobs.write_text(
-                json.dumps(
-                    {
-                        "job_id": "job_1",
-                        "object_uid": "uid-1",
-                        "base_scene_id": "bistro_interior",
-                        "lineage": {"render_job_digest": "sha256:deadbeef"},
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            config_path = root / "config.yaml"
-            config_path.write_text(
-                yaml.safe_dump(
-                    {
-                        "paths": {
-                            "render_output_root": str(root),
-                            "render_jobs_manifest": str(jobs),
-                        },
-                        "data": {
-                            "split_profile": "object-held-out",
-                            "require_composition_contract": True,
-                        },
-                        "render": {
-                            "train_fraction": 0.7,
-                            "validation_fraction": 0.2,
-                            "test_fraction": 0.1,
-                            "split_seed": 7,
-                            "passes": {
-                                "min_base_color_linked_ratio": 0.9,
-                                "max_magenta_ratio": 0.0001,
-                            },
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
+            for index, scene in enumerate(("bistro_interior", "bistro_exterior", "bistro_wine")):
+                row = metadata_row(f"job_{index}", scene)
+                if index == 0:
+                    row["passes"] = passes
+                component = root / "components" / f"job_{index}"
+                component.mkdir(parents=True)
+                (component / "metadata.json").write_text(json.dumps(row), encoding="utf-8")
+            config_path = write_stage2_config(root)
+
             previous = sys.argv
             sys.argv = ["build_manifests.py", "--config", str(config_path)]
             try:
@@ -234,10 +207,16 @@ class ManifestCameraCoordinateTest(unittest.TestCase):
             finally:
                 sys.argv = previous
 
-            shipped = json.loads(
-                (root / "manifests" / "train.jsonl").read_text(encoding="utf-8").strip()
-            )
-            self.assertEqual(shipped["passes"], passes)
+            shipped = []
+            for split in ("train", "validation", "test"):
+                path = root / "manifests" / f"{split}.jsonl"
+                if path.is_file():
+                    shipped.extend(
+                        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line
+                    )
+            with_passes = [row for row in shipped if "passes" in row]
+            self.assertEqual(len(with_passes), 1)
+            self.assertEqual(with_passes[0]["passes"], passes)
             release = json.loads((root / "dataset_release.json").read_text(encoding="utf-8"))
             self.assertTrue(release["intrinsic_passes"]["enabled"])
             self.assertEqual(release["intrinsic_passes"]["rows_with_passes"], 1)
@@ -245,23 +224,52 @@ class ManifestCameraCoordinateTest(unittest.TestCase):
                 release["intrinsic_passes"]["definitions"]["albedo"], "cycles_diffuse_color"
             )
 
-    def test_validator_rejects_missing_or_wrong_camera_position(self) -> None:
-        validator = load_script(
-            "tokenlight/validate_components.py", "validate_components_test"
-        )
-        row = metadata_row()
-        converted, _, _ = coordinates.convert_row(row, require_intrinsics=False)
-        validator.require_camera_position(converted, converted["point_lights"][0], "point_light")
+    def test_validator_flags_missing_component_and_scene_leakage(self) -> None:
+        validator = load_script("tokenlight/validate_components.py", "validate_components_test")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            component = root / "components" / "job_1"
+            component.mkdir(parents=True)
+            row = coordinates.convert_row(metadata_row(), require_intrinsics=False)[0]
+            for relative in (
+                row["ambient"],
+                row["dark"],
+                row["point_lights"][0]["path"],
+                row["diffuse"][0]["path"],
+                row["diffuse"][1]["path"],
+                row["in_scene_lights"][0]["path"],
+                row["in_scene_lights"][0]["mask"],
+            ):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"x")
+            quality = {
+                "min_base_color_linked_ratio": 0.9,
+                "max_magenta_ratio": 1e-4,
+                "require_textures": False,
+            }
+            counts = {
+                "point_lights": 0,
+                "diffuse": 0,
+                "in_scene_lights": 0,
+                "scene_native_fixtures": 0,
+                "procedural_fallback_fixtures": 0,
+                "pass_sets": 0,
+            }
+            self.assertEqual(validator.validate_row(row, root, quality, counts), 7)
 
-        missing = json.loads(json.dumps(converted))
-        del missing["point_lights"][0]["camera_position"]
-        with self.assertRaises(ValueError):
-            validator.require_camera_position(missing, missing["point_lights"][0], "point_light")
+            with self.assertRaises(ValueError):
+                validator.validate_row({**row, "scene_id": ""}, root, quality, counts)
 
-        wrong = json.loads(json.dumps(converted))
-        wrong["point_lights"][0]["camera_position"] = [2.0, 3.0, 1.0]
-        with self.assertRaises(ValueError):
-            validator.require_camera_position(wrong, wrong["point_lights"][0], "point_light")
+            broken = json.loads(json.dumps(row))
+            (root / broken["dark"]).unlink()
+            with self.assertRaises(ValueError):
+                validator.validate_row(broken, root, quality, counts)
+
+            leaked = json.loads(json.dumps(row))
+            leaked["scene_id"] = ""
+            with self.assertRaises(ValueError):
+                validator.validate_row(leaked, root, quality, counts)
 
 
 if __name__ == "__main__":

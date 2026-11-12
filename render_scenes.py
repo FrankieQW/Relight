@@ -1,3 +1,12 @@
+"""Render scene-only TokenLight samples with one Blender worker per GPU.
+
+Input is the manifest written by ``plan_scene_cameras.py``
+(``scene_camera_jobs.jsonl``); output is ``components/<job_id>/`` with the linear
+components, intrinsic passes and ``metadata.json``.
+
+    python render_dataset.py --workers 2
+"""
+
 from __future__ import annotations
 
 import json
@@ -23,7 +32,7 @@ def clear_render_partial(config: ProjectConfig, *, job_id: str) -> dict[str, Any
     return clear_failed_render_partial(config.path("tokenlight_output"), jobs, job_id)
 
 
-def render_compositions(
+def render_scenes(
     config: ProjectConfig,
     *,
     blender_bin: str | None = None,
@@ -34,7 +43,7 @@ def render_compositions(
     jobs_path = config.path("render_jobs_output")
     jobs = load_jsonl(jobs_path)
     if not jobs:
-        raise ValueError(f"render job manifest is empty: {jobs_path}")
+        raise ValueError(f"render job manifest is empty; run plan_scene_cameras first: {jobs_path}")
     job_ids = _validated_job_ids(jobs, jobs_path)
     output_root = config.path("tokenlight_output")
     assert_no_existing_render_partials(output_root, jobs)
@@ -42,13 +51,6 @@ def render_compositions(
     selected_blender = str(blender_bin or m4.get("blender_bin") or config.section("scene").get("blender_bin"))
     if not selected_blender:
         raise ValueError("m4.blender_bin or scene.blender_bin is required")
-    object_root_env = str(m4.get("object_root_env", "OBJECT_ROOT"))
-    object_root_value = os.environ.get(object_root_env)
-    if not object_root_value:
-        raise EnvironmentError(f"required environment variable is not set: {object_root_env}")
-    object_root = Path(object_root_value).expanduser().resolve()
-    if not object_root.is_dir():
-        raise NotADirectoryError(object_root)
 
     gpu_ids = [int(value) for value in m4.get("render_gpu_ids", [0])]
     if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids) or any(value < 0 for value in gpu_ids):
@@ -58,17 +60,17 @@ def render_compositions(
     render_config = _resolved_render_config(config, m4.get("render", {}))
     runtime_root = output_root / "runtime"
     runtime_root.mkdir(parents=True, exist_ok=True)
-    script = Path(__file__).resolve().parent / "blender" / "render_composition.py"
+    # The worker resolves these from the package, not from config.root.
+    script = Path(__file__).resolve().parent / "blender" / "render_scene.py"
     if not script.is_file():
         raise FileNotFoundError(script)
 
     processes: list[tuple[int, list[str], subprocess.Popen[str], Path, Any]] = []
     for worker_index in range(worker_count):
         gpu_id = gpu_ids[worker_index % len(gpu_ids)]
-        snapshot = runtime_root / f"composition_worker_{worker_index:03d}.json"
+        snapshot = runtime_root / f"scene_worker_{worker_index:03d}.json"
         worker_runtime = {
             "project_root": str(config.root),
-            "object_root": str(object_root),
             "jobs_path": str(jobs_path),
             "output_root": str(output_root),
             "worker_index": worker_index,
@@ -76,11 +78,12 @@ def render_compositions(
             "gpu_id": gpu_id,
             "render": render_config,
             "fixture": m4.get("fixture", {}),
+            "camera_gate": _camera_gate(config, m4),
             "overwrite": bool(m4.get("overwrite", False)),
             "allow_partial": bool(allow_partial),
         }
         dump_json_atomic(snapshot, worker_runtime)
-        log_path = runtime_root / f"composition_worker_{worker_index:03d}.log"
+        log_path = runtime_root / f"scene_worker_{worker_index:03d}.log"
         command = [
             selected_blender,
             "--background",
@@ -93,8 +96,8 @@ def render_compositions(
         ]
         environment = os.environ.copy()
         environment["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        # Write each worker directly to its own file.  PIPE would allow an
-        # uncollected worker to fill its buffer while we wait on another one.
+        # Write each worker straight to its own file: PIPE would let an uncollected
+        # worker fill its buffer while we wait on another one.
         log_handle = log_path.open("w", encoding="utf-8")
         process = subprocess.Popen(
             command,
@@ -127,11 +130,11 @@ def render_compositions(
             load_jsonl(output_root / "render_workers" / f"worker_{worker_index:03d}" / "errors.jsonl")
         )
     dump_jsonl_atomic(output_root / "render_errors.jsonl", render_errors)
-    expected_metadata = {
-        job_id: output_root / "components" / job_id / "metadata.json" for job_id in job_ids
-    }
-    missing_job_outputs = [job_id for job_id, path in expected_metadata.items() if not path.is_file()]
-    metadata_count = len(jobs) - len(missing_job_outputs)
+    missing_job_outputs = [
+        job_id
+        for job_id in job_ids
+        if not (output_root / "components" / job_id / "metadata.json").is_file()
+    ]
     completed_ids = {
         path.parent.name for path in (output_root / "components").glob("*/metadata.json")
     }
@@ -139,7 +142,7 @@ def render_compositions(
     summary = {
         "generated_at": utc_now(),
         "jobs": len(jobs),
-        "rendered_or_reused": metadata_count,
+        "rendered_or_reused": len(jobs) - len(missing_job_outputs),
         "render_errors": len(render_errors),
         "worker_failures": worker_failures,
         "missing_job_outputs": missing_job_outputs,
@@ -148,7 +151,7 @@ def render_compositions(
     }
     dump_json_atomic(output_root / "render_summary.json", summary)
     if worker_failures and not allow_partial:
-        raise RuntimeError(f"{len(worker_failures)} Blender composition worker(s) failed")
+        raise RuntimeError(f"{len(worker_failures)} Blender scene worker(s) failed")
     if render_errors and not allow_partial:
         raise RuntimeError(
             f"{len(render_errors)} render job(s) failed; see {output_root / 'render_errors.jsonl'}"
@@ -159,6 +162,21 @@ def render_compositions(
             f"see {output_root / 'render_summary.json'}"
         )
     return summary
+
+
+def _camera_gate(config: ProjectConfig, m4: dict[str, Any]) -> dict[str, Any]:
+    """Thresholds the Blender worker uses to re-validate a planned pose."""
+    gate = dict(m4.get("camera_gate", {}))
+    gate.setdefault("camera_radius", 0.20)
+    gate.setdefault("near_clearance", 0.30)
+    gate.setdefault("ray_grid", 16)
+    gate.setdefault("max_depth", 45.0)
+    gate.setdefault("min_hit_fraction", 0.90)
+    gate.setdefault("max_near_fraction", 0.25)
+    gate.setdefault("near_window", 1.00)
+    gate.setdefault("max_single_object_fraction", 0.90)
+    gate.setdefault("min_depth_spread_ratio", 1.35)
+    return gate
 
 
 def _resolved_render_config(config: ProjectConfig, value: Any) -> dict[str, Any]:
@@ -190,3 +208,6 @@ def _validated_job_ids(jobs: list[dict[str, Any]], jobs_path: Path) -> list[str]
             f"render job manifest contains missing or duplicate job_id values: {jobs_path}"
         )
     return job_ids
+
+
+__all__ = ["clear_render_partial", "render_scenes"]

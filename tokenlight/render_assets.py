@@ -452,12 +452,31 @@ def configure_render(config: dict) -> None:
 
 
 PASS_SOCKETS = {
-    "albedo": "Diffuse Color",
-    "normal_world": "Normal",
-    "direct": "Diffuse Direct",
-    "indirect": "Diffuse Indirect",
-    "color": "Diffuse Color",
+    # Blender 4.5 renamed the Render Layers passes to short identifiers:
+    # "Diffuse Color" -> "DiffCol", "Diffuse Direct" -> "DiffDir",
+    # "Diffuse Indirect" -> "DiffInd".  Each key lists its known spellings and
+    # the first available socket wins, so 4.2-4.5 all resolve.
+    "albedo": ("Diffuse Color", "DiffCol"),
+    "normal_world": ("Normal",),
+    "direct": ("Diffuse Direct", "DiffDir"),
+    "indirect": ("Diffuse Indirect", "DiffInd"),
+    "color": ("Diffuse Color", "DiffCol"),
 }
+
+
+def _pass_socket(layers, candidates):
+    """Resolve a render-layer pass socket across Blender naming schemes."""
+    if isinstance(candidates, str):
+        candidates = (candidates,)
+    for name in candidates:
+        socket = layers.outputs.get(name)
+        if socket is not None:
+            return socket
+    available = ", ".join(output.name for output in layers.outputs)
+    raise RuntimeError(
+        f"none of the render layer passes {tuple(candidates)} is available on "
+        f"Blender {bpy.app.version_string}; available: {available}"
+    )
 
 
 def configure_passes(config: dict) -> None:
@@ -491,7 +510,7 @@ def configure_passes(config: dict) -> None:
         output.format.color_mode = "RGB"
         output.file_slots[0].path = f"{key}_"
         output.mute = True
-        tree.links.new(layers.outputs[socket], output.inputs[0])
+        tree.links.new(_pass_socket(layers, socket), output.inputs[0])
 
 
 def _pass_outputs():
