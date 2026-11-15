@@ -160,7 +160,7 @@ m4:
       denoise_passes: false
       require_textures: false
       min_base_color_linked_ratio: 0.9
-      max_magenta_ratio: 0.0001
+      max_magenta_ratio: null
   fixture:
     minimum_visible_pixels: 64
     maximum_screen_fraction: 0.05

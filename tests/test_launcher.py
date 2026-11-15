@@ -52,6 +52,11 @@ def scratch():
         shutil.rmtree(path, ignore_errors=True)
 
 
+def tearDownModule() -> None:
+    """Leave no scratch files behind after a run."""
+    shutil.rmtree(PACKAGE_DIR / ".test-tmp", ignore_errors=True)
+
+
 def _load_launcher(path: Path, name: str = "_launcher_under_test"):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
@@ -155,9 +160,13 @@ class PlanSceneCamerasCommandTest(unittest.TestCase):
 
         with scratch() as temporary:
             root = Path(temporary)
+            blend = root / "room_a.blend"
+            blend.write_bytes(b"fake-blend")
+            scene = room_scene("room_a")
+            scene["normalized_blend"] = str(blend)
             scene_path = root / "scene.json"
             scene_path.write_text(
-                json.dumps({"schema_version": "1.0", "scenes": [room_scene("room_a")]}),
+                json.dumps({"schema_version": "1.0", "scenes": [scene]}),
                 encoding="utf-8",
             )
             config_path = root / "sceneonly.json"  # JSON is valid YAML

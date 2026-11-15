@@ -167,7 +167,9 @@ class SceneManifestTest(unittest.TestCase):
             self.assertEqual(release["counts"]["train"] + release["counts"]["validation"] + release["counts"]["test"], 3)
             self.assertEqual(release["scenes"], {split: 1 for split in ("train", "validation", "test")})
             self.assertEqual(release["camera_position"]["axes"], "x=right,y=down,z=forward")
-            self.assertEqual(release["camera_position"]["rows_with_image_plane_pixels"], 1)
+            # All three jobs reuse the same fixture light, which does project
+            # inside the 1024x1024 image plane in front of the camera.
+            self.assertEqual(release["camera_position"]["rows_with_image_plane_pixels"], 3)
 
     def test_passes_block_passthrough_unchanged(self) -> None:
         builder = load_script("tokenlight/build_manifests.py", "build_manifests_passes")
@@ -223,6 +225,66 @@ class SceneManifestTest(unittest.TestCase):
             self.assertEqual(
                 release["intrinsic_passes"]["definitions"]["albedo"], "cycles_diffuse_color"
             )
+
+    def test_validator_requires_all_irradiance_components(self) -> None:
+        validator = load_script("tokenlight/validate_components.py", "validate_components_irr")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            row = json.loads(json.dumps(metadata_row()))
+            for relative in (
+                row["ambient"],
+                row["dark"],
+                row["point_lights"][0]["path"],
+                row["diffuse"][0]["path"],
+                row["diffuse"][1]["path"],
+                row["in_scene_lights"][0]["path"],
+                row["in_scene_lights"][0]["mask"],
+            ):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"x")
+            passes_dir = root / "components" / "job_1" / "passes"
+            (passes_dir / "irradiance").mkdir(parents=True, exist_ok=True)
+            for name in ("albedo.exr", "normal_camera.exr", "valid_mask.png"):
+                (passes_dir / name).write_bytes(b"x")
+            (passes_dir / "irradiance" / "ambient.exr").write_bytes(b"x")
+            audit = {
+                "materials": 0,
+                "textured": 0,
+                "textured_materials": 0,
+                "base_color_linked": 0,
+                "base_color_linked_ratio": None,
+                "unknown_materials": 0,
+                "linked_without_image": 0,
+                "missing_image_files": 0,
+                "missing_examples": [],
+                "rows": [],
+            }
+            (passes_dir / "material_audit.json").write_text(json.dumps(audit), encoding="utf-8")
+            row["passes"] = {
+                "enabled": {"albedo": True, "normal": True, "irradiance": True},
+                "albedo": "components/job_1/passes/albedo.exr",
+                "normal_camera": "components/job_1/passes/normal_camera.exr",
+                "valid_mask": "components/job_1/passes/valid_mask.png",
+                "material_audit": "components/job_1/passes/material_audit.json",
+                "irradiance": {"ambient": "components/job_1/passes/irradiance/ambient.exr"},
+            }
+            quality = {
+                "min_base_color_linked_ratio": 0.9,
+                "max_magenta_ratio": None,
+                "require_textures": False,
+            }
+            counts = {
+                "point_lights": 0,
+                "diffuse": 0,
+                "in_scene_lights": 0,
+                "scene_native_fixtures": 0,
+                "procedural_fallback_fixtures": 0,
+                "pass_sets": 0,
+            }
+            with self.assertRaises(ValueError) as raised:
+                validator.validate_row(row, root, quality, counts)
+            self.assertIn("missing component keys", str(raised.exception))
 
     def test_validator_flags_missing_component_and_scene_leakage(self) -> None:
         validator = load_script("tokenlight/validate_components.py", "validate_components_test")

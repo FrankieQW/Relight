@@ -19,7 +19,7 @@ of being guessed.
 """
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -27,6 +27,7 @@ __all__ = [
     "albedo_quality",
     "derive_irradiance",
     "evaluate_material_audit",
+    "identity_error",
     "local_variance",
     "valid_mask",
     "world_normals_to_camera",
@@ -115,8 +116,63 @@ def valid_mask(
     normals = _as_image(world_normals, "world_normals")
     if albedo_image.shape != normals.shape:
         raise ValueError(f"albedo/normal shapes disagree: {albedo_image.shape} vs {normals.shape}")
-    geometry = np.linalg.norm(normals, axis=2) > 0.5
+    geometry = np.linalg.norm(normals, axis=2) > 0.0
     return np.all(albedo_image >= eps, axis=2) & geometry
+
+
+def identity_error(
+    albedo: Any,
+    irradiance: Any,
+    radiance: Any,
+    dark: Any,
+    *,
+    valid: Any | None = None,
+    min_albedo: float = 0.1,
+    eps: float = 1e-4,
+) -> dict[str, float] | None:
+    """Compare ``albedo * irradiance`` with ``radiance - dark``.
+
+    This is the acceptance identity from GUID §10.3/§10.7.  Only pixels whose
+    albedo exceeds ``min_albedo`` (and, when supplied, that are ``valid``) are
+    compared; returns ``None`` when no pixel qualifies.
+
+    Relative error uses ``|target|`` as the denominator with a small ``eps``
+    floor so near-black pixels cannot inflate the statistic.
+    """
+    albedo_image = _as_image(albedo, "albedo")
+    irradiance_image = _as_image(irradiance, "irradiance")
+    radiance_image = _as_image(radiance, "radiance")
+    dark_image = _as_image(dark, "dark")
+    shapes = {
+        albedo_image.shape,
+        irradiance_image.shape,
+        radiance_image.shape,
+        dark_image.shape,
+    }
+    if len(shapes) != 1:
+        raise ValueError(f"identity shapes disagree: {sorted(shapes)}")
+    mask = np.all(albedo_image > float(min_albedo), axis=2)
+    if valid is not None:
+        valid_array = np.asarray(valid)
+        if valid_array.shape != mask.shape:
+            raise ValueError(
+                f"valid mask shape {valid_array.shape} disagrees with image {mask.shape}"
+            )
+        mask &= valid_array.astype(bool)
+    count = int(mask.sum())
+    if count == 0:
+        return None
+    predicted = albedo_image * irradiance_image
+    target = radiance_image - dark_image
+    relative = np.abs(predicted[mask] - target[mask]) / np.maximum(
+        np.abs(target[mask]), float(eps)
+    )
+    return {
+        "pixels": float(count),
+        "median_relative_error": float(np.median(relative)),
+        "mean_relative_error": float(np.mean(relative)),
+        "p99_relative_error": float(np.percentile(relative, 99)),
+    }
 
 
 def local_variance(image: Any, window: int = 5) -> np.ndarray:
@@ -162,8 +218,12 @@ def albedo_quality(
     """
     image = _as_image(albedo, "albedo")
     red, green, blue = image[..., 0], image[..., 1], image[..., 2]
-    magenta = (red > 1.0 - magenta_tolerance) & (green < magenta_tolerance) & (
-        blue > 1.0 - magenta_tolerance
+    background = np.all(image <= flat_threshold, axis=2)
+    magenta = (
+        (red > 1.0 - magenta_tolerance)
+        & (green < magenta_tolerance)
+        & (blue > 1.0 - magenta_tolerance)
+        & ~background
     )
     variance = local_variance(image, local_window)
     textured = variance > flat_threshold

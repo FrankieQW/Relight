@@ -22,7 +22,17 @@ python plan_scene_cameras.py --cameras-per-scene 32
 python render_dataset.py --blender-bin /opt/blender-4.5/blender --workers 2
 ```
 
-失败重跑时用 `python clear_render_partial.py --job-id <job_id>` 明确清掉某次渲染的 partial。
+失败重跑时，用 `--clear-failed` 一次性清掉本批失败留下的 partial（只清带 `failure.json`、且没有已完成产物的那些）：
+
+```bash
+python render_dataset.py --clear-failed --blender-bin /opt/blender-4.5/blender
+```
+
+只想清某一个 job 就用 `python clear_render_partial.py --job-id <job_id>`。
+
+**重试前需要删什么**：只需要清 `outputs/tokenlight_dataset/components/*.partial`。`outputs/` 下其余内容可以留着——
+`scene_camera_jobs.jsonl` 是规划结果（删了要重跑 `plan_scene_cameras.py`），`render_errors.jsonl` /
+`render_summary.json` 是上一次的诊断记录（每次跑都会覆盖）。已完成的 `components/<job_id>/` 也会被复用。
 
 | 脚本 | 作用 | 主要输出 |
 |---|---|---|

@@ -1,0 +1,18 @@
+# Python / tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test + run scratch directories
+.test-tmp/
+.pytmp/
+.sim/
+
+# Data and outputs (produced by the pipeline, never committed)
+data/
+outputs/
+*.blend
+*.exr
+*.hdr

@@ -57,6 +57,7 @@ def main(argv: list[str] | None = None) -> None:
             blender_bin=args.blender_bin,
             workers=args.workers,
             allow_partial=args.allow_partial,
+            clear_failed=args.clear_failed,
         )
         _print_summary("render", result)
         return
@@ -108,6 +109,7 @@ def _plan_scene_cameras(config, args) -> dict[str, Any]:
         fixture_categories={str(value) for value in m4.get("fixture_categories", [])},
         base_scene_license=m4.get("base_scene_license", {}),
         license_policy_version=str(m4.get("license_policy_version", "unconfigured")),
+        project_root=config.root,
     )
     max_jobs = m4.get("max_render_jobs")
     jobs = document["jobs"]
@@ -168,6 +170,12 @@ def _build_parser() -> argparse.ArgumentParser:
     render.add_argument("--blender-bin", default=None)
     render.add_argument("--workers", type=int, default=None)
     render.add_argument("--allow-partial", action="store_true")
+    render.add_argument(
+        "--clear-failed",
+        action="store_true",
+        help="Clear every failed partial of the current manifest before rendering "
+        "(same evidence rules as clear-render-partial, for a whole batch)",
+    )
 
     clear_partial = subparsers.add_parser(
         "clear-render-partial",

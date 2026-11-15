@@ -9,9 +9,9 @@ components, intrinsic passes and ``metadata.json``.
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 from typing import Any
 
@@ -32,12 +32,54 @@ def clear_render_partial(config: ProjectConfig, *, job_id: str) -> dict[str, Any
     return clear_failed_render_partial(config.path("tokenlight_output"), jobs, job_id)
 
 
+def clear_failed_partials(config: ProjectConfig) -> dict[str, Any]:
+    """Clear every failed partial that belongs to a job in the current manifest.
+
+    This is the bulk counterpart of ``clear_render_partial``.  It keeps the same
+    safety rule -- a partial is only removed when it carries ``failure.json``
+    evidence and has no completed ``metadata.json`` -- but does it for a whole
+    failed batch instead of one ``--job-id`` at a time.  Without it, retrying a
+    64-job batch means 64 manual invocations.
+    """
+    output_root = config.path("tokenlight_output")
+    jobs_path = config.path("render_jobs_output")
+    jobs = load_jsonl(jobs_path)
+    if not jobs:
+        raise ValueError(f"render job manifest is empty: {jobs_path}")
+    job_ids = _validated_job_ids(jobs, jobs_path)
+    cleared: list[str] = []
+    kept: list[dict[str, str]] = []
+    for job_id in job_ids:
+        partial = output_root / "components" / f"{job_id}.partial"
+        final_metadata = output_root / "components" / job_id / "metadata.json"
+        if not partial.is_dir():
+            continue
+        if final_metadata.is_file():
+            kept.append({"job_id": job_id, "reason": "completed_output_exists"})
+            continue
+        if not (partial / "failure.json").is_file():
+            kept.append({"job_id": job_id, "reason": "no_failure_evidence"})
+            continue
+        shutil.rmtree(partial)
+        cleared.append(job_id)
+    return {
+        "stats": {
+            "cleared": len(cleared),
+            "kept": len(kept),
+            "manifest_jobs": len(job_ids),
+        },
+        "cleared_job_ids": cleared,
+        "kept": kept,
+    }
+
+
 def render_scenes(
     config: ProjectConfig,
     *,
     blender_bin: str | None = None,
     workers: int | None = None,
     allow_partial: bool = False,
+    clear_failed: bool = False,
 ) -> dict[str, Any]:
     m4 = config.section("m4")
     jobs_path = config.path("render_jobs_output")
@@ -46,6 +88,11 @@ def render_scenes(
         raise ValueError(f"render job manifest is empty; run plan_scene_cameras first: {jobs_path}")
     job_ids = _validated_job_ids(jobs, jobs_path)
     output_root = config.path("tokenlight_output")
+    cleared: dict[str, Any] | None = None
+    if clear_failed:
+        # Bulk-retry path: drop every failed partial of this manifest, keeping the
+        # same evidence rules as the single-job clear.
+        cleared = clear_failed_partials(config)
     assert_no_existing_render_partials(output_root, jobs)
     output_root.mkdir(parents=True, exist_ok=True)
     selected_blender = str(blender_bin or m4.get("blender_bin") or config.section("scene").get("blender_bin"))
@@ -68,6 +115,9 @@ def render_scenes(
     processes: list[tuple[int, list[str], subprocess.Popen[str], Path, Any]] = []
     for worker_index in range(worker_count):
         gpu_id = gpu_ids[worker_index % len(gpu_ids)]
+        # A worker writes its own completed/errors files; clear the previous run
+        # first so a worker that dies early cannot resurface stale errors.
+        shutil.rmtree(output_root / "render_workers" / f"worker_{worker_index:03d}", ignore_errors=True)
         snapshot = runtime_root / f"scene_worker_{worker_index:03d}.json"
         worker_runtime = {
             "project_root": str(config.root),
@@ -148,6 +198,7 @@ def render_scenes(
         "missing_job_outputs": missing_job_outputs,
         "foreign_completed_outputs": foreign_completed_ids,
         "allow_partial": bool(allow_partial),
+        "cleared_partials": cleared,
     }
     dump_json_atomic(output_root / "render_summary.json", summary)
     if worker_failures and not allow_partial:
@@ -210,4 +261,4 @@ def _validated_job_ids(jobs: list[dict[str, Any]], jobs_path: Path) -> list[str]
     return job_ids
 
 
-__all__ = ["clear_render_partial", "render_scenes"]
+__all__ = ["clear_failed_partials", "clear_render_partial", "render_scenes"]

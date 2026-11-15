@@ -22,11 +22,7 @@ datacompose/
 ├── __main__.py                 python -m datacompose
 ├── _launcher.py                脚本启动器：包名注册 + 缺省 --config
 ├── cli.py                      M1–M4 统一入口（依赖惰性导入）
-├── prepare_objects.py          python prepare_objects.py        → prepare-objects
 ├── prepare_scenes.py           python prepare_scenes.py         → prepare-scenes
-├── annotate_construction.py    python annotate_construction.py  → annotate-construction
-├── prepare_geometry.py         python prepare_geometry.py       → prepare-geometry
-├── build_render_jobs.py        python build_render_jobs.py      → build-render-jobs
 ├── render_dataset.py           python render_dataset.py         → render
 ├── clear_render_partial.py     python clear_render_partial.py   → clear-render-partial
 ├── plan_scene_cameras.py       python plan_scene_cameras.py     → plan-scene-cameras
@@ -379,7 +375,8 @@ cd <本项目目录>              # 包含 prepare_scenes.py 等脚本的目录
 python prepare_scenes.py       --blender-bin /opt/blender-4.5/blender
 python plan_scene_cameras.py   --cameras-per-scene 32
 python render_dataset.py       --blender-bin /opt/blender-4.5/blender
-python clear_render_partial.py --job-id <job_id>
+python render_dataset.py       --clear-failed        # 重试前清掉本批失败 partial
+python clear_render_partial.py --job-id <job_id>     # 只清单个 job
 ```
 
 脚本与 CLI 子命令一一对应，参数完全一致：
@@ -520,19 +517,21 @@ eps 默认 1e-3
   （X 右、Y **下**、Z 前），与 manifest 里的 `camera_position` 同一坐标系。`intrinsic.world_normals_to_camera`
   负责这个转换（Y 轴取负）。
 - `valid_mask` 标出可用的像素：albedo 三通道都 ≥ eps **且** 背后确有几何（法线非零）。
+  只有 `albedo` 与 `normal` 同时开启时才会产出。
 
-> 也可以把 `irradiance_mode` 设为 `override`：用白色朗伯材质覆盖渲染、发光灯具除外，得到精确对照，
-> 渲染时间约 ×2，**不默认开启**。
+> **当前实现范围**：`irradiance_mode` 只支持 `derived`，`normal_space` 只支持 `camera`；
+> 设为 `override` / `world` 会在渲染开始时直接报错，而不是静默回退。
+> 用白色朗伯材质覆盖渲染的 `override` 方案尚未实现，渲染时间不会 ×2。
 
 ### 10.2 产出布局
 
 ```text
 components/<job_id>/
 └── passes/
-    ├── albedo.exr              # 每 job 一张（Diffuse Color）
-    ├── normal_camera.exr       # 每 job 一张（相机空间单位法线）
-    ├── normal_world.exr        # 可选（save_normal_world: true）
-    ├── valid_mask.png          # 每 job 一张，8-bit
+    ├── albedo.exr              # albedo:true 时产出（Diffuse Color）
+    ├── normal_camera.exr       # normal:true 时产出（相机空间单位法线）
+    ├── normal_world.exr        # 可选（normal:true 且 save_normal_world:true）
+    ├── valid_mask.png          # albedo 与 normal 同时开启时产出，8-bit
     ├── material_audit.json     # 每 job 一份，见 10.4
     └── irradiance/
         ├── ambient.exr
@@ -546,6 +545,7 @@ components/<job_id>/
 "passes": {
   "definition": {"albedo": "cycles_diffuse_color", "irradiance": "diffuse_radiance_over_albedo",
                  "normal": "camera_space_unit_opencv", "eps": 0.001},
+  "enabled": {"albedo": true, "normal": true, "irradiance": true, "normal_world": false},
   "albedo": "components/<id>/passes/albedo.exr",
   "normal_camera": "components/<id>/passes/normal_camera.exr",
   "valid_mask": "components/<id>/passes/valid_mask.png",
@@ -554,6 +554,10 @@ components/<job_id>/
   "irradiance": {"ambient": "...", "point_000": "...", "fixture_000": "..."}
 }
 ```
+
+`enabled` 记录本 job 实际产出了哪些 pass；`albedo` / `normal_camera` / `valid_mask` /
+`normal_world` 这些键只在对应开关打开时出现，`validate_components.py` 也按 `enabled` 检查，
+因此关闭单项开关不会产生“metadata 指向不存在文件”的假错误。
 
 `build_manifests.py` 逐行透传 `metadata.json`，不改写 `passes` 路径；`dataset_release.json` 增加
 `intrinsic_passes: {enabled, rows_with_passes, definitions, quality_thresholds}` 汇总。
@@ -633,23 +637,23 @@ m4:
   render:
     passes:
       enabled: false              # 默认关闭，现有数据逐字节不变
-      albedo: true
+      albedo: true                # albedo 与 normal 至少开一个
       normal: true
-      irradiance: true
-      irradiance_mode: derived    # derived | override
-      normal_space: camera        # camera | world
-      save_normal_world: false
+      irradiance: true            # 需要 albedo:true
+      irradiance_mode: derived    # 目前仅实现 derived
+      normal_space: camera        # 目前仅实现 camera
+      save_normal_world: false    # 需要 normal:true
       pass_samples: 1
       eps: 0.001
-      denoise_passes: false
+      denoise_passes: false       # 预留，当前未生效
       require_textures: false
       min_base_color_linked_ratio: 0.9
-      max_magenta_ratio: 0.0001
+      max_magenta_ratio: null     # null = 不做品红阈值检查
 ```
 
 成本（`derived` 模式）：`+2` 次 1-sample 渲染/job（albedo、normal 参考），`+~19` 个 EXR/job。
 512² RGB half ≈ 1.5 MB/张 → 约 +28 MB/job；960² 约 +100 MB/job；时间增量预计 < 10%。
-`override` 模式约 ×2 渲染时间，仅作对照。回滚只需把 `passes.enabled` 改回 `false`，代码路径与现状一致。
+回滚只需把 `passes.enabled` 改回 `false`，代码路径与现状一致。
 
 ### 10.7 验收命令
 
@@ -664,9 +668,21 @@ python -m datacompose.cli render --blender-bin /opt/blender-4.5/blender
 
 # P2：数据门
 python -m datacompose.tokenlight.validate_components --config <dataset-config>.yaml
+
+# P2（可选，需要 opencv-python）：同时校验像素与 albedo×irradiance 恒等式
+python -m datacompose.tokenlight.validate_components --config <dataset-config>.yaml --pixel-checks
 ```
 
 验收标准（P2 结束）：10 个 job 全部通过 `validate_components`；`albedo × irradiance ≈ component − dark`
 在 `albedo>0.1` 像素上的相对误差中位数 < 5%；`magenta_ratio = 0`；单 job 输出增量在预算内；
 关闭开关后产物与当前一致。
+
+> 注：`validate_components.py` 默认做结构检查（文件存在、material_audit、按 `enabled` 的字段齐全、
+> 每个 point/fixture 分量都有对应 `irradiance`）与质量阈值检查。加上 `--pixel-checks` 后会解码
+> albedo / normal / irradiance 像素，校验法线单位长度、irradiance 非负，并逐分量验证
+> `albedo × irradiance_L ≈ component_L − dark`（`albedo>0.1` 且 `valid` 的像素，中位相对误差 < 5%）。
+> 像素检查需要 `opencv-python`；未安装时默认模式仍可运行。
+>
+> 注意：`--pixel-checks` 目前只接受 `.npy` 或 OpenCV 能解码的 EXR；如果 OpenCV 未编译 OpenEXR 支持，
+> 会直接报解码错误而不是静默跳过。
 

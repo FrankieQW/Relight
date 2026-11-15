@@ -130,10 +130,19 @@ def with_camera_coordinates(row: dict) -> dict:
 
 
 def has_image_plane_pixels(row: dict) -> bool:
+    """True when a light actually projects inside the image in front of the camera."""
     for field in ("point_lights", "in_scene_lights"):
         for light in row.get(field) or []:
             plane = light.get("image_plane") if isinstance(light, dict) else None
-            if isinstance(plane, dict) and "u" in plane:
+            if not isinstance(plane, dict) or "u" not in plane or "v" not in plane:
+                continue
+            if not bool(plane.get("in_front", True)):
+                continue
+            width = float(plane.get("width", 0.0))
+            height = float(plane.get("height", 0.0))
+            if width <= 0.0 or height <= 0.0:
+                continue
+            if 0.0 <= float(plane["u"]) < width and 0.0 <= float(plane["v"]) < height:
                 return True
     return False
 
@@ -156,13 +165,14 @@ def intrinsic_passes_payload(rows: list[dict], render: dict) -> dict:
         if isinstance(block, dict) and isinstance(block.get("definition"), dict):
             definitions = dict(block["definition"])
             break
+    max_magenta = render_passes.get("max_magenta_ratio", 1e-4)
     return {
         "enabled": any(isinstance(row.get("passes"), dict) for row in rows),
         "rows_with_passes": sum(1 for row in rows if isinstance(row.get("passes"), dict)),
         "definitions": definitions,
         "quality_thresholds": {
             "min_base_color_linked_ratio": float(render_passes.get("min_base_color_linked_ratio", 0.9)),
-            "max_magenta_ratio": float(render_passes.get("max_magenta_ratio", 1e-4)),
+            "max_magenta_ratio": None if max_magenta is None else float(max_magenta),
             "min_textured_pixel_ratio": 0.02,
         },
     }

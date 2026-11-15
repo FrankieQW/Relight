@@ -22,11 +22,11 @@ PROJECT_ROOT = PACKAGE_ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from datacompose import intrinsic  # noqa: E402
 from datacompose.intrinsic import (  # noqa: E402
     albedo_quality,
     derive_irradiance,
     evaluate_material_audit,
+    identity_error,
     local_variance,
     valid_mask,
     world_normals_to_camera,
@@ -135,6 +135,33 @@ class ValidMaskTest(unittest.TestCase):
         self.assertEqual(mask.tolist(), [[True, False, False]])
 
 
+class IdentityErrorTest(unittest.TestCase):
+    def test_exact_identity_has_zero_error(self) -> None:
+        albedo = np.full((4, 4, 3), 0.5, dtype=np.float32)
+        irradiance = np.full((4, 4, 3), 0.4, dtype=np.float32)
+        dark = np.full((4, 4, 3), 0.1, dtype=np.float32)
+        radiance = albedo * irradiance + dark
+        report = identity_error(albedo, irradiance, radiance, dark)
+        self.assertIsNotNone(report)
+        self.assertEqual(report["pixels"], 16.0)
+        self.assertLess(report["median_relative_error"], 1e-6)
+
+    def test_wrong_irradiance_is_flagged(self) -> None:
+        albedo = np.full((4, 4, 3), 0.5, dtype=np.float32)
+        irradiance = np.full((4, 4, 3), 0.4, dtype=np.float32)
+        dark = np.zeros((4, 4, 3), dtype=np.float32)
+        radiance = albedo * irradiance + dark
+        report = identity_error(albedo, irradiance * 2.0, radiance, dark)
+        self.assertGreater(report["median_relative_error"], 0.5)
+
+    def test_low_albedo_pixels_are_ignored(self) -> None:
+        albedo = np.full((4, 4, 3), 0.05, dtype=np.float32)
+        irradiance = np.ones((4, 4, 3), dtype=np.float32)
+        dark = np.zeros((4, 4, 3), dtype=np.float32)
+        radiance = np.ones((4, 4, 3), dtype=np.float32)
+        self.assertIsNone(identity_error(albedo, irradiance, radiance, dark))
+
+
 class AlbedoQualityTest(unittest.TestCase):
     def test_flat_image_has_no_texture(self) -> None:
         flat = np.full((8, 8, 3), 0.5, dtype=np.float32)
@@ -193,7 +220,18 @@ def _write_pass_set(
     np.save(root / "normal_camera.npy", normal.astype(np.float32))
     np.save(root / "valid_mask.npy", valid)
     np.save(root / "irradiance.npy", irradiance.astype(np.float32))
-    audit = {"textured_materials": 3, "base_color_linked_ratio": 1.0, "missing_image_files": 0}
+    audit = {
+        "materials": 0,
+        "textured": 3,
+        "textured_materials": 0,
+        "base_color_linked": 0,
+        "base_color_linked_ratio": None,
+        "unknown_materials": 0,
+        "linked_without_image": 0,
+        "missing_image_files": 0,
+        "missing_examples": [],
+        "rows": [],
+    }
     (root / "material_audit.json").write_text(json.dumps(audit), encoding="utf-8")
     return {
         "definition": {"eps": 1e-3, "albedo": "cycles_diffuse_color"},
@@ -281,6 +319,46 @@ class ValidatorPassesTest(unittest.TestCase):
         magenta[..., 2] = 1.0
         with self.assertRaises(ValueError):
             self._run(magenta, normal, valid, irradiance, require_textures=True)
+
+    def test_identity_holds_for_matching_components(self) -> None:
+        albedo, normal, valid, irradiance = self._base()
+        dark = np.full_like(albedo, 0.05)
+        ambient = albedo * irradiance + dark
+        with temp_root() as root:
+            passes = _write_pass_set(
+                root, albedo=albedo, normal=normal, valid=valid, irradiance=irradiance
+            )
+            counts: dict = {}
+            self.validator.validate_passes(
+                root,
+                {"id": "scene-test", "passes": passes},
+                ambient,
+                counts,
+                require_textures=False,
+                dark=dark,
+                components={"ambient": ambient},
+            )
+            self.assertIn("ambient", counts["pass_identity"])
+            self.assertLess(counts["pass_identity"]["ambient"]["median_relative_error"], 1e-5)
+
+    def test_identity_violation_raises(self) -> None:
+        albedo, normal, valid, irradiance = self._base()
+        dark = np.zeros_like(albedo)
+        ambient = albedo * irradiance
+        with temp_root() as root:
+            passes = _write_pass_set(
+                root, albedo=albedo, normal=normal, valid=valid, irradiance=irradiance * 3.0
+            )
+            with self.assertRaises(ValueError):
+                self.validator.validate_passes(
+                    root,
+                    {"id": "scene-test", "passes": passes},
+                    ambient,
+                    {},
+                    require_textures=False,
+                    dark=dark,
+                    components={"ambient": ambient},
+                )
 
     def test_magenta_albedo_is_only_a_warning_when_not_required(self) -> None:
         albedo, normal, valid, irradiance = self._base()

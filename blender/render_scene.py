@@ -82,8 +82,23 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
     final_directory = output_root / "components" / job["job_id"]
     metadata_path = final_directory / "metadata.json"
     if metadata_path.is_file() and not bool(runtime.get("overwrite", False)):
-        _validate_reusable_metadata(metadata_path, job)
-        return metadata_path.relative_to(output_root).as_posix()
+        passes_config = _render_config(runtime.get("render", {})).get("passes") or {}
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        passes_dir = final_directory / "passes"
+        if bool(passes_config.get("enabled", False)) and _incomplete_pass_set(
+            metadata,
+            passes_dir,
+            output_root,
+            bool(passes_config.get("save_normal_world", False)),
+        ):
+            # A crash after deletion must fail visibly instead of leaving a
+            # completed-looking sample without its requested pass set.
+            # Intentionally non-atomic: if re-rendering fails, a later resume
+            # cannot mistake the old sample for complete.
+            shutil.rmtree(final_directory)
+        else:
+            _validate_reusable_metadata(metadata_path, job)
+            return metadata_path.relative_to(output_root).as_posix()
     if final_directory.exists():
         if not bool(runtime.get("overwrite", False)):
             raise FileExistsError(f"incomplete output exists and overwrite=false: {final_directory}")
@@ -93,11 +108,18 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
     blend_path = (project_root / job["base_scene_blend"]).resolve()
     if not blend_path.is_file():
         raise FileNotFoundError(blend_path)
-    if _sha256_file(blend_path) != job["base_scene_digest"]:
-        raise ValueError("base scene blend digest changed after camera planning")
+    if _cached_sha256(blend_path) != job["base_scene_digest"]:
+        raise ValueError(
+            "base scene blend digest changed after camera planning: "
+            f"{blend_path} (re-run plan_scene_cameras.py)"
+        )
 
-    # Preflight passed: only now is a partial directory allowed to exist.
-    partial = recovery.prepare_render_partial(output_root, job["job_id"])
+    # Two preflight stages, no partial output yet:
+    #   1. the blend exists and matches the digest the planner recorded;
+    #   2. the planned pose survives exact triangle re-validation.
+    # Only then is a partial directory created, so a rejected or stale pose
+    # cannot leave 60+ partials behind that each need `clear-render-partial`.
+    partial: Path | None = None
     try:
         bpy.ops.wm.open_mainfile(filepath=str(blend_path))
         render_config = _render_config(runtime.get("render", {}))
@@ -112,6 +134,7 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
 
         gate = _validate_camera_pose(job, runtime)
         camera = _apply_camera(job, render_config, gate)
+        partial = recovery.prepare_render_partial(output_root, job["job_id"])
         bpy.context.scene.camera = camera
         anchor = Vector(tuple(float(value) for value in job["camera"]["target"]))
 
@@ -119,62 +142,23 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
         background, ambient_hdri = _configure_ambient_world(render_config, job)
 
         passes_ctx = None
-        quality = None
-        material_audit = None
+        passes_metadata = None
         if passes_enabled:
-            passes_dir = partial / "passes"
-            passes_dir.mkdir(parents=True, exist_ok=True)
-            material_audit = helpers.audit_materials()
-            (passes_dir / "material_audit.json").write_text(
-                json.dumps(material_audit, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-                encoding="utf-8",
+            passes_ctx = _prepare_pass_context(
+                partial,
+                output_root,
+                final_directory,
+                passes_config,
+                intrinsic,
+                coordinates,
+                camera,
+                anchor,
+                helpers,
             )
-            problems = intrinsic.evaluate_material_audit(
-                material_audit,
-                min_base_color_linked_ratio=float(
-                    passes_config.get("min_base_color_linked_ratio", 0.9)
-                ),
-                require_textures=bool(passes_config.get("require_textures", False)),
-            )
-            if problems:
-                raise ValueError(
-                    "material audit gate failed (require_textures=true): " + "; ".join(problems)
-                )
-            eps = float(passes_config.get("eps", 0.001))
-            reference = helpers.render_pass_reference(passes_dir, passes_config)
-            albedo_image = helpers.read_linear_image(reference["albedo"])
-            normal_world = helpers.read_linear_image(reference["normal_world"])
-            frame = coordinates.CameraFrame.from_row(
-                {
-                    "canonical": {
-                        "origin": [float(value) for value in anchor],
-                        "position_axes": "x=right,y=camera-forward,z=up",
-                    },
-                    "camera": {
-                        "location": [float(value) for value in camera.location],
-                        "target": [float(value) for value in anchor],
-                        "rotation_euler": [float(value) for value in camera.rotation_euler],
-                    },
-                }
-            )
-            normal_camera = intrinsic.world_normals_to_camera(normal_world, frame)
-            valid = intrinsic.valid_mask(albedo_image, normal_world, eps=eps)
-            quality = intrinsic.albedo_quality(albedo_image)
-            helpers.save_linear_image(passes_dir / "normal_camera.exr", normal_camera)
-            helpers.save_mask_image(passes_dir / "valid_mask.png", valid.astype(np.float32))
-            if not bool(passes_config.get("save_normal_world", False)):
-                (passes_dir / "normal_world.exr").unlink(missing_ok=True)
-            passes_ctx = {
-                "enabled": True,
-                "dir": passes_dir,
-                "config": passes_config,
-                "eps": eps,
-                "irradiance": {},
-            }
 
         ambient_path = partial / "ambient.exr"
         background.inputs["Strength"].default_value = float(render_config["ambient_world_strength"])
-        if passes_ctx is not None and bool(passes_config.get("irradiance", True)):
+        if _irradiance_enabled(passes_ctx):
             outcome = helpers.render_exr(
                 ambient_path,
                 passes_ctx["dir"],
@@ -214,38 +198,9 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
             partial, output_root, final_directory, camera, anchor, anchor_depth, render_config, helpers
         )
 
-        passes_metadata = None
         if passes_ctx is not None:
-            passes_metadata = {
-                "definition": {
-                    "albedo": "cycles_diffuse_color",
-                    "irradiance": "diffuse_radiance_over_albedo",
-                    "normal": "camera_space_unit_opencv",
-                    "eps": float(passes_ctx["eps"]),
-                },
-                "albedo": _future_relative(
-                    passes_dir / "albedo.exr", partial, final_directory, output_root
-                ),
-                "normal_camera": _future_relative(
-                    passes_dir / "normal_camera.exr", partial, final_directory, output_root
-                ),
-                "valid_mask": _future_relative(
-                    passes_dir / "valid_mask.png", partial, final_directory, output_root
-                ),
-                "material_audit": _future_relative(
-                    passes_dir / "material_audit.json", partial, final_directory, output_root
-                ),
-                "quality": {
-                    "base_color_linked_ratio": (material_audit or {}).get("base_color_linked_ratio"),
-                    "magenta_ratio": float(quality["magenta_ratio"]),
-                    "textured_pixel_ratio": float(quality["textured_pixel_ratio"]),
-                },
-                "irradiance": dict(passes_ctx["irradiance"]),
-            }
-            if bool(passes_config.get("save_normal_world", False)):
-                passes_metadata["normal_world"] = _future_relative(
-                    passes_dir / "normal_world.exr", partial, final_directory, output_root
-                )
+            passes_metadata = passes_ctx["metadata"]
+            passes_metadata["irradiance"] = dict(passes_ctx["irradiance"])
 
         metadata = {
             "schema_version": job["schema_version"],
@@ -302,6 +257,8 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
             "license": job.get("license", {}),
         }
         if passes_metadata is not None:
+            if not helpers.cleanup_pass_temporaries(passes_ctx["dir"]):
+                raise RuntimeError("pass temporary files remain after render")
             metadata["passes"] = passes_metadata
         (partial / "metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
@@ -311,7 +268,13 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
         os.replace(partial, final_directory)
         return (final_directory / "metadata.json").relative_to(output_root).as_posix()
     except BaseException:
-        if partial.exists():
+        # Only a real render attempt leaves partial evidence; preflight failures
+        # (bad digest, rejected pose) are reported through errors.jsonl alone.
+        if partial is not None and partial.exists():
+            try:
+                helpers.cleanup_pass_temporaries(partial / "passes")
+            except BaseException:
+                pass
             (partial / "failure.json").write_text(
                 json.dumps({"job_id": job.get("job_id"), "traceback": traceback.format_exc()}, indent=2),
                 encoding="utf-8",
@@ -430,7 +393,6 @@ def _validate_camera_pose(job: dict[str, Any], runtime: dict[str, Any]) -> dict[
 def _camera_clearance(location: Vector, radius: float) -> float:
     """Distance from the camera centre to the nearest rendered surface."""
     best = radius
-    depsgraph = bpy.context.evaluated_depsgraph_get()
     for obj in sorted(bpy.data.objects, key=lambda item: item.name):
         if obj.type != "MESH" or obj.hide_render:
             continue
@@ -554,6 +516,140 @@ def _select_native_fixture(job, runtime, camera, anchor, partial, helpers, rng):
     raise ValueError("no fixture could be selected for this camera")
 
 
+def _irradiance_enabled(passes_ctx) -> bool:
+    """Check whether this lighting render can derive irradiance."""
+    return bool(
+        passes_ctx is not None
+        and passes_ctx["config"].get("albedo", True)
+        and passes_ctx["config"].get("irradiance", True)
+    )
+
+
+def _prepare_pass_context(
+    partial,
+    output_root,
+    final_directory,
+    passes_config,
+    intrinsic,
+    coordinates,
+    camera,
+    anchor,
+    helpers,
+):
+    passes_dir = partial / "passes"
+    passes_dir.mkdir(parents=True, exist_ok=True)
+    material_audit = helpers.audit_materials()
+    problems = intrinsic.evaluate_material_audit(
+        material_audit,
+        min_base_color_linked_ratio=float(passes_config.get("min_base_color_linked_ratio", 0.9)),
+        require_textures=bool(passes_config.get("require_textures", False)),
+    )
+    if problems:
+        raise ValueError(
+            "material audit gate failed (require_textures=true): " + "; ".join(problems)
+        )
+    eps = float(passes_config.get("eps", 0.001))
+    use_albedo = bool(passes_config.get("albedo", True))
+    use_normal = bool(passes_config.get("normal", True))
+    use_irradiance = bool(passes_config.get("irradiance", True))
+    save_normal_world = bool(passes_config.get("save_normal_world", False))
+    irradiance_mode = str(passes_config.get("irradiance_mode", "derived"))
+    normal_space = str(passes_config.get("normal_space", "camera"))
+    if irradiance_mode not in {"derived", "diffuse_radiance_over_albedo"}:
+        raise ValueError(
+            "passes.irradiance_mode is not implemented: "
+            f"{irradiance_mode!r} (only 'derived')"
+        )
+    if normal_space != "camera":
+        raise ValueError(
+            f"passes.normal_space is not implemented: {normal_space!r} (only 'camera')"
+        )
+    if not use_albedo and not use_normal:
+        raise ValueError("passes.albedo and passes.normal are both disabled")
+    if use_irradiance and not use_albedo:
+        raise ValueError("passes.irradiance=true requires passes.albedo=true")
+    if save_normal_world and not use_normal:
+        raise ValueError("passes.save_normal_world=true requires passes.normal=true")
+
+    reference_keys = tuple(
+        key
+        for key, enabled in (("albedo", use_albedo), ("normal_world", use_normal))
+        if enabled
+    )
+    reference = helpers.render_pass_reference(passes_dir, passes_config, save=reference_keys)
+    albedo_image = helpers.read_linear_image(reference["albedo"]) if use_albedo else None
+    normal_world = helpers.read_linear_image(reference["normal_world"]) if use_normal else None
+    quality = intrinsic.albedo_quality(albedo_image) if albedo_image is not None else None
+    helpers.move_pass_outputs(
+        passes_dir,
+        output_root,
+        material_audit,
+        albedo=use_albedo,
+        normal=use_normal,
+        save_normal_world=save_normal_world,
+        rendered=reference_keys,
+    )
+
+    paths: dict[str, Path] = {"material_audit": passes_dir / "material_audit.json"}
+    if use_albedo and use_normal:
+        mask = intrinsic.valid_mask(albedo_image, normal_world, eps=eps)
+        paths["valid_mask"] = passes_dir / "valid_mask.png"
+        helpers.save_mask_image(paths["valid_mask"], mask.astype(np.float32))
+    if use_normal:
+        frame = coordinates.CameraFrame.from_row(
+            {
+                "canonical": {
+                    "origin": [float(value) for value in anchor],
+                    "position_axes": "x=right,y=camera-forward,z=up",
+                },
+                "camera": {
+                    "location": [float(value) for value in camera.location],
+                    "target": [float(value) for value in anchor],
+                    "rotation_euler": [float(value) for value in camera.rotation_euler],
+                },
+            }
+        )
+        normal_camera = intrinsic.world_normals_to_camera(normal_world, frame)
+        paths["normal_camera"] = passes_dir / "normal_camera.exr"
+        helpers.save_linear_image(paths["normal_camera"], normal_camera)
+    if use_albedo:
+        paths["albedo"] = passes_dir / "albedo.exr"
+    if save_normal_world:
+        paths["normal_world"] = passes_dir / "normal_world.exr"
+
+    metadata: dict[str, Any] = {
+        "definition": {
+            "albedo": "cycles_diffuse_color",
+            "irradiance": "diffuse_radiance_over_albedo",
+            "normal": "camera_space_unit_opencv",
+            "eps": eps,
+        },
+        "enabled": {
+            "albedo": use_albedo,
+            "normal": use_normal,
+            "irradiance": use_irradiance,
+            "normal_world": save_normal_world,
+        },
+        "quality": {
+            "base_color_linked_ratio": material_audit.get("base_color_linked_ratio"),
+            "magenta_ratio": float(quality["magenta_ratio"]) if quality is not None else None,
+            "textured_pixel_ratio": (
+                float(quality["textured_pixel_ratio"]) if quality is not None else None
+            ),
+        },
+        "irradiance": {},
+    }
+    for key, path in paths.items():
+        metadata[key] = _future_relative(path, partial, final_directory, output_root)
+    return {
+        "enabled": True,
+        "dir": passes_dir,
+        "config": passes_config,
+        "eps": eps,
+        "metadata": metadata,
+        "irradiance": {},
+    }
+
 def _render_fixture_component(
     fixture, partial, output_root, final_directory, config, helpers, anchor, passes_ctx=None
 ):
@@ -571,7 +667,7 @@ def _render_fixture_component(
         )
     try:
         component_path = partial / "in_scene_lights" / "fixture_000_on.exr"
-        if passes_ctx is not None and bool(passes_ctx["config"].get("irradiance", True)):
+        if _irradiance_enabled(passes_ctx):
             outcome = helpers.render_exr(
                 component_path,
                 passes_ctx["dir"],
@@ -650,7 +746,7 @@ def _render_point_components(
             bpy.context.view_layer.update()
             path = partial / "point_lights" / f"light_{index:03d}.exr"
             label = f"point_{index:03d}"
-            if passes_ctx is not None and bool(passes_ctx["config"].get("irradiance", True)):
+            if _irradiance_enabled(passes_ctx):
                 outcome = helpers.render_exr(
                     path, passes_ctx["dir"], ("irradiance",), name=label, eps=passes_ctx["eps"]
                 )
@@ -864,7 +960,7 @@ def _render_config(value: dict[str, Any]) -> dict[str, Any]:
             "denoise_passes": False,
             "require_textures": False,
             "min_base_color_linked_ratio": 0.9,
-            "max_magenta_ratio": 0.0001,
+            "max_magenta_ratio": None,
         },
     }
     result = {**defaults, **(value or {})}
@@ -985,6 +1081,54 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+_BLEND_DIGESTS: dict[Path, str] = {}
+
+
+def _cached_sha256(path: Path) -> str:
+    """Hash a blend once per worker process.
+
+    A Bistro blend can be several gigabytes and one worker renders many cameras
+    from the same scene, so re-hashing per job would dominate start-up time.
+    """
+    resolved = path.resolve()
+    if resolved not in _BLEND_DIGESTS:
+        _BLEND_DIGESTS[resolved] = _sha256_file(resolved)
+    return _BLEND_DIGESTS[resolved]
+
+
+def _incomplete_pass_set(
+    metadata: dict[str, Any],
+    passes_dir: Path,
+    output_root: Path,
+    save_normal_world: bool,
+) -> bool:
+    """Return True when a completed sample is missing a pass it declares."""
+    if not passes_dir.is_dir():
+        return True
+    block = metadata.get("passes")
+    if not isinstance(block, dict):
+        return True
+    # ``material_audit`` is always written.  The other products only exist when
+    # their toggle was on, so require exactly what the metadata declares.
+    paths = [block.get("material_audit")]
+    for key in ("albedo", "normal_camera", "valid_mask", "normal_world"):
+        if block.get(key):
+            paths.append(block[key])
+    irradiance = block.get("irradiance")
+    if isinstance(irradiance, dict):
+        paths.extend(irradiance.values())
+    if save_normal_world and not block.get("normal_world"):
+        return True
+    prefix = "components/" + passes_dir.parent.name + "/passes/"
+    for value in paths:
+        if not value or not str(value).startswith(prefix):
+            return True
+        path = output_root / str(value)
+        if not path.is_file() or path.stat().st_size == 0:
+            return True
+    return False
 
 
 def _validate_reusable_metadata(metadata_path: Path, job: dict[str, Any]) -> None:

@@ -35,6 +35,7 @@ import hashlib
 import json
 import math
 import random
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -544,6 +545,7 @@ def build_camera_job(
     lighting_profile: dict[str, Any],
     fixture_entity_ids: Sequence[str] = (),
     license_block: dict[str, Any] | None = None,
+    source_scene_digest: str = "",
     schema_version: str = "1.0",
 ) -> dict[str, Any]:
     location = [float(value) for value in metrics["location"]]
@@ -628,20 +630,30 @@ def build_camera_job(
         "fixture_entity_ids": [str(value) for value in fixture_entity_ids],
         "license": dict(license_block or {}),
         "free_space_report": {
-            "node_count": int(metrics.get("ray_count", 0)),
+            "ray_count": int(metrics.get("ray_count", 0)),
             "dominant_node_id": metrics.get("dominant_node_id"),
             "anchor_depth": float(metrics["anchor_depth"]),
             "depth_p10": float(metrics["depth_p10"]),
             "depth_p90": float(metrics["depth_p90"]),
         },
         "lineage": {
-            "scene_digest": scene.get("source_digest"),
+            "blend_digest": base_scene_digest,
+            "source_scene_digest": source_scene_digest or scene.get("source_digest"),
             "scene_camera_contract_version": SCENE_CAMERA_CONTRACT_VERSION,
             "camera_spec": spec.as_dict(),
             "scene_camera_digest": digest,
         },
     }
     return job
+
+
+def _sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    """Content digest of a file, in the same ``sha256:<hex>`` form as io_utils."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _stable_digest(value: Any) -> str:
@@ -663,8 +675,15 @@ def build_scene_camera_jobs(
     base_scene_license: dict[str, Any] | None = None,
     license_policy_version: str = "unconfigured",
     require_all_scenes: bool = True,
+    project_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Plan camera jobs for every scene in a ``scene.json`` document."""
+    """Plan camera jobs for every scene in a ``scene.json`` document.
+
+    ``scene.json`` stores ``normalized_blend`` relative to the project root, so
+    ``project_root`` must be supplied to resolve and hash it; falling back to the
+    process CWD would record a digest for the wrong file when the planner is
+    launched from another directory.
+    """
     spec = spec or CameraSpec()
     profile = lighting_profile or {
         "name": "scene_native_v1",
@@ -680,13 +699,36 @@ def build_scene_camera_jobs(
         "decision": "allowed" if scene_license.get("decision") == "allowed" else "unverified",
     }
     scenes = sorted(scene_document.get("scenes", []), key=lambda row: row["scene_id"])
+    root = (Path(project_root).expanduser() if project_root is not None else Path.cwd()).resolve()
     jobs: list[dict[str, Any]] = []
     rejects: list[dict[str, Any]] = []
     per_scene: dict[str, Any] = {}
+    blend_digests: dict[Path, str] = {}
     for scene in scenes:
         scene_id = str(scene["scene_id"])
         blend = blend_by_scene.get(scene_id, str(scene.get("normalized_blend", "")))
-        digest = str(scene.get("source_digest", ""))
+        # `base_scene_digest` must describe the *blend file* the renderer opens:
+        # the renderer hashes that file and refuses stale jobs.  `source_digest`
+        # is the source FBX and belongs in lineage only.
+        if not blend:
+            rejects.append({"scene_id": scene_id, "reason": "missing_normalized_blend_path"})
+            continue
+        blend_path = Path(blend).expanduser()
+        if not blend_path.is_absolute():
+            blend_path = (root / blend_path).resolve()
+        if not blend_path.is_file():
+            rejects.append(
+                {
+                    "scene_id": scene_id,
+                    "reason": "missing_base_scene_blend",
+                    "detail": str(blend_path),
+                }
+            )
+            continue
+        if blend_path not in blend_digests:
+            blend_digests[blend_path] = _sha256_file(blend_path)
+        digest = blend_digests[blend_path]
+        source_digest = str(scene.get("source_digest", ""))
         fixture_ids = sorted(
             entity["entity_id"]
             for entity in scene.get("entities", [])
@@ -717,6 +759,7 @@ def build_scene_camera_jobs(
                     index=index,
                     base_scene_blend=blend,
                     base_scene_digest=digest,
+                    source_scene_digest=source_digest,
                     lighting_profile=profile,
                     fixture_entity_ids=fixture_ids,
                     license_block=license_block,

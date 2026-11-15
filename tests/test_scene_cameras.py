@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import shutil
 import sys
 import unittest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+SCRATCH = Path(__file__).resolve().parents[1] / ".test-tmp"
+
+
+def tearDownModule() -> None:
+    """Leave no scratch files behind after a run."""
+    shutil.rmtree(SCRATCH, ignore_errors=True)
 
 from datacompose import coordinates  # noqa: E402
 from datacompose.scene_cameras import (  # noqa: E402
@@ -240,10 +248,16 @@ class ManifestContractTest(unittest.TestCase):
         )
 
     def test_scene_document_yields_jobs_per_scene(self) -> None:
-        document = {
-            "schema_version": "1.0",
-            "scenes": [room_scene("room_a"), room_scene("room_b")],
-        }
+        scratch = Path(__file__).resolve().parents[1] / ".test-tmp" / "multi_scene"
+        scratch.mkdir(parents=True, exist_ok=True)
+        scenes = []
+        for scene_id in ("room_a", "room_b"):
+            blend = scratch / f"{scene_id}.blend"
+            blend.write_bytes(b"fake-blend")
+            scene = room_scene(scene_id)
+            scene["normalized_blend"] = str(blend)
+            scenes.append(scene)
+        document = {"schema_version": "1.0", "scenes": scenes}
         result = build_scene_camera_jobs(document, seed=1, cameras_per_scene=2)
         self.assertEqual(len(result["jobs"]), 4)
         self.assertEqual({job["scene_id"] for job in result["jobs"]}, {"room_a", "room_b"})
@@ -251,6 +265,9 @@ class ManifestContractTest(unittest.TestCase):
         self.assertEqual(result["stats"]["scenes"], 2)
         for job in result["jobs"]:
             coordinates.CameraFrame.from_row(job)
+            # The digest must describe the blend the renderer will open.
+            self.assertTrue(job["base_scene_digest"].startswith("sha256:"))
+            self.assertNotEqual(job["base_scene_digest"], scene["source_digest"])
 
     def test_basis_is_orthonormal(self) -> None:
         for yaw in (0.0, 37.0, 180.0, 271.5):
