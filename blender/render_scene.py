@@ -139,6 +139,9 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
         anchor = Vector(tuple(float(value) for value in job["camera"]["target"]))
 
         _disable_native_lighting()
+        metallic_fixed = _normalise_material_metallic()
+        if metallic_fixed:
+            print(f"SCENE_METALLIC normalised {metallic_fixed} materials", flush=True)
         background, ambient_hdri = _configure_ambient_world(render_config, job)
 
         passes_ctx = None
@@ -1029,6 +1032,31 @@ def _disable_native_lighting() -> None:
                     color.default_value = (0.0, 0.0, 0.0, 1.0)
             elif node.type == "EMISSION" and node.inputs.get("Strength") is not None:
                 node.inputs["Strength"].default_value = 0.0
+
+
+def _normalise_material_metallic() -> int:
+    """Zero the Metallic input when it has no texture.
+
+    The Bistro assets ship without a metallic map, so the importer leaves
+    ``Metallic`` at its 1.0 default on almost every material -- including cloth,
+    curtains and food.  A fully metallic surface has no diffuse closure, so the
+    Cycles ``DiffCol`` pass (which is what the albedo pass reads) renders as
+    black and ``irradiance = diffuse_radiance / albedo`` divides by ~0.
+
+    Linked Metallic inputs are left alone: those carry real data.
+    """
+    changed = 0
+    for material in bpy.data.materials:
+        if not material.use_nodes or material.node_tree is None:
+            continue
+        for node in material.node_tree.nodes:
+            if node.type != "BSDF_PRINCIPLED":
+                continue
+            metallic = node.inputs.get("Metallic")
+            if metallic is not None and not metallic.is_linked and float(metallic.default_value) != 0.0:
+                metallic.default_value = 0.0
+                changed += 1
+    return changed
 
 
 def _configure_ambient_world(config: dict[str, Any], job: dict[str, Any]):
