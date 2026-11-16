@@ -26,6 +26,8 @@ datacompose/
 ├── render_dataset.py           python render_dataset.py         → render
 ├── clear_render_partial.py     python clear_render_partial.py   → clear-render-partial
 ├── plan_scene_cameras.py       python plan_scene_cameras.py     → plan-scene-cameras
+├── probe_scenes.py             python probe_scenes.py           → probe-scenes（需 Blender）
+├── probes.py                   三角面距离场探针：烘焙数据格式 + 纯 NumPy 查询
 ├── config.py                   YAML 配置与项目根解析
 ├── coordinates.py              相机坐标 / 图像平面 / 深度（transfer.py 的模块版 + 扩展）
 ├── intrinsic.py                物理表征通道推导（albedo / irradiance / normal，纯 NumPy）
@@ -35,6 +37,7 @@ datacompose/
 ├── scene_cameras.py            场景内无碰撞相机采样（AABB 宽相 + 空心容器 + 视野无穿插判据）
 ├── scene_targets.py            目标实体挑选 + 投影/可见性几何（实体条件化取景）
 ├── scene_extract.py            prepare-scenes（调用 blender/entry.py）
+├── scene_probe.py              probe-scenes（调度 blender/probe_scene.py，逐场景烘焙探针）
 ├── render_scenes.py            render（多 GPU worker 调度 blender/render_scene.py）
 ├── render_recovery.py          渲染 partial 的清理与恢复
 ├── transfer.py                 坐标约定权威参考实现（纯标准库）
@@ -44,6 +47,7 @@ datacompose/
 │   └── scene_overrides.yaml
 ├── blender/
 │   ├── entry.py                FBX 导入、归一化、稳定 ID、scene fragment
+│   ├── probe_scene.py          场景烘焙成三角面 clearance 探针（npz）
 │   └── render_scene.py         相机位姿精确复核、光照、分量渲染、metadata
 ├── tokenlight/
 │   ├── render_assets.py        Blender 侧渲染工具（供 render_scene.py 动态加载）
@@ -52,7 +56,8 @@ datacompose/
 ├── scripts/
 │   └── remove_legacy_object_pipeline.sh   清理 object 时代残留文件
 ├── tools/
-│   └── bench_scene_cameras.py  相机搜索成本基准
+│   ├── bench_scene_cameras.py  相机搜索成本基准
+│   └── probe_smoke_test.py     探针烘焙冒烟测试（需 Blender，无数据）
 ├── docs/
 │   └── scene_only_render_feasibility.md   纯场景合成可行性方案
 └── tests/
@@ -63,7 +68,8 @@ datacompose/
     ├── test_launcher.py
     ├── test_scene_cameras.py
     ├── test_scene_camera_targets.py
-    └── test_scene_containers.py
+    ├── test_scene_containers.py
+    └── test_scene_probe.py
 ```
 
 本目录是**独立可复制的 compose 项目**：只依赖自身代码与本目录下的 `configs/`、`transfer.py`，
@@ -76,9 +82,10 @@ datacompose/
 
 ```text
 data/scene/scene.json ── plan-scene-cameras ─→ scene_camera_jobs.jsonl
-                                                      │
-                                      render（Blender：位姿复核 + 渲染）
-                                                      │
+        │                                             │
+        └─ probe-scenes（可选）                        render（Blender：位姿复核 + 渲染）
+           → <scene_id>.probe.npz  ──┐                       │
+                                     └───────────────────────┤
               components/<job_id>/{ambient,dark,point_lights,diffuse,in_scene_lights}.exr
               components/<job_id>/metadata.json      ← canonical + world 坐标在这里落盘
                                                       │
@@ -90,8 +97,18 @@ data/scene/scene.json ── plan-scene-cameras ─→ scene_camera_jobs.jsonl
 一个 render job 是 `(scene, camera pose, lighting profile, seed)`，与物体无关。每个 job 都从只读 base
 `.blend` 重新打开，渲染完回滚，不把上一个样本的状态带进下一个。
 
-相机位姿由 `scene_cameras.py` 规划（AABB 宽相），再由 `blender/render_scene.py` 用真实三角面复核：
+相机位姿由 `scene_cameras.py` 规划，再由 `blender/render_scene.py` 用真实三角面复核：
 穿过几何体、贴脸、只对着一面墙、深度过平都会让这个 job 直接失败，而不是产出一张坏图。
+
+规划侧有两种几何判据，由 `m4.camera.free_space.source` 选：
+
+- `aabb`：只用每个节点的世界 AABB（宽相）。便宜、保守，但**盒子永远高估物体**，所以 L 形房间会被
+  当成矩形、多层建筑的相机可能落到隔壁楼层、一个“被误判成空心”的箱子会让相机站进墙里。
+- `probe`：用 `probe-scenes` 烘焙的三角面距离场（见 7.2）。位置从“已验证自由的体素列”里采样，
+  视线也用同一份场来投射，因此“规划器认为自由”和“渲染器认为自由”是同一个判据。
+
+`auto`（默认）有探针就用、没有就退回 AABB，所以**没烘焙探针的数据集行为不变**——这一点由
+`free_space.source: aabb` 再加一层显式保证。
 
 渲染产物里的 `position` 是 canonical 坐标系；训练需要的 OpenCV 相机坐标由 `build_manifests.py` 在
 生成本文件时写入 `camera_position`，因此 **manifest 才是训练该读的那份数据**，`components/*/metadata.json`
@@ -509,7 +526,14 @@ python -m unittest discover -s datacompose/tests -p 'test_*.py'
 `tests/test_scene_containers.py` 覆盖空心容器模型：容器检测、室内 clearance/raycast、`outside_room`、
 `aabb_legacy` 复现旧的“室内全灭”、三种地板来源的优先级、目标几何过滤（薄片/超大/跨度）、
 `framability_score` 排序、以及轴平行射线伪命中的回归；同时校验 `configs/default.yaml` 里
-`m4.camera` / `camera.target` / `camera.container` 的键与 dataclass 字段一致（防止配置与代码漂移）。
+`m4.camera` / `camera.target` / `camera.container` / `camera.free_space` / `m4.probe` 的键
+与 dataclass 字段一致（防止配置与代码漂移），并断言这些新阈值的默认值不改变旧行为。
+`tests/test_scene_probe.py` 覆盖探针：距离场数值（用解析 AABB 距离做真值）、`npz` 往返、查询是
+保守下界、`cast` 命中/逃逸与节点归属、`support_z` 推地板、多层建筑两层都能出机位、
+`ProbeFreeSpace` 与 AABB 的节点/容器契约、软判据 `view_coverage`、`min_coverage` 拒绝、
+以及规划侧四种状态（`probe` / `no_probe` / `source_aabb` / `probe_stale`）；最后用一个
+假的 Blender 替身把 `probe-scenes` 端到端跑通（产出、`probe_summary.json`、resume 跳过、
+单场景失败只发警告、`require_all` 才抛错）。
 
 ### 7.1 相机策略调参
 
@@ -539,6 +563,103 @@ python -m datacompose.tools.bench_scene_cameras --strategy entity_conditioned_v1
 `min_target_visible_ratio` 太高或遮挡体判得太死，`no_geometry_in_view` 偏多说明
 `min_hit_fraction_targeted` 太高，`camera_inside_geometry` 偏多而场景明显是室内时检查
 `camera.container.model` / `min_contained_nodes`（容器没被识别出来）。
+
+### 7.2 探针阶段（`probe-scenes`）
+
+`AABB` 是宽相：盒子永远包含自己的网格，所以它分不清“空房间的壳”和“实心箱子”，
+也表达不了 L 形房间。这类近似每一个都会变成“规划器接受、渲染器拒绝”的废样本。
+彻底的做法是**直接问几何**，只问一次，然后把答案缓存下来——这也是 BlenderProc 的
+`probe` / `check_novel_pose` 一类做法的思路。
+
+```bash
+python probe_scenes.py --blender-bin /opt/blender-4.5/blender --workers 4
+```
+
+一个 `(scene)` 的产物是布局在 base `.blend` 旁边的 `<stem>.probe.npz`：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `format` | str | `lc_probe_v1`，读的时候不匹配直接拒绝 |
+| `origin` / `resolution` | float64 | 体素网格原点与边长（米） |
+| `clearance` | float32 `(nx,ny,nz)` | 到最近三角面的距离，钳到 `m4.probe.clearance_cap` |
+| `nearest_node` | int32 | 该最近三角面属于哪个 `scene.json` 节点（`node_ids` 下标） |
+| `node_ids` | str[] | 烘焙时写下的节点 id |
+
+三个关键设计点：
+
+- **不需要内外判定。** “到最近三角面 ≥ `camera_radius`”本身就是判据——距离场对墙体两侧是对称的，
+  所以一个点只要离所有三角面都够远，它就不可能在几何体里。唯一漏掉的情形是“实心墙比两倍相机半径
+  还厚”，而 `render_scene.py` 在渲染前仍会逐位复核，漏网的只会浪费一个 job，不会产出坏图。
+- **地板是从距离场里推出来的，不额外烘焙。** 一列体素里 clearance 第一次超过阈值的位置就是“可以站的
+  地面”，而这个体素属于哪一段连续自由段，就决定它属于哪一层楼。多层建筑因此自然正确。
+  这也替代了旧的 `_floor_boxes` / `outside_room` 两条启发式。
+- **查询是保守下界。** 距离场是 1-Lipschitz 的，所以“取最近体素的值、再减去查询点到该体素中心的距离”
+  一定不超过真值。规划器永远不会被告知“这里比实际上更宽敞”。
+
+  代价是**系统性低估**：实测（10×10×3 房间，13 cm 体素，3000 个随机点）平均低估 6 cm、
+  最坏 17 cm（约 1.3 × 体素边长），**高估 0 次**——所以只会误拒、不会误收。
+  想减少误拒就调小 `m4.probe.resolution`（成本线性上升），或者用 AABB 粗筛后只对候选做精细判定。
+
+`container`（谁是房间壳）仍然由 AABB 提供：dominance 判据必须把房间本身排除掉，否则所有室内视图
+都会因为“所有射线都打在墙上”而失败。这个猜测出错现在只是诊断数字不准，`ProbeFreeSpace` 只把
+`container_at` / `outside_room` 委派给 AABB，碰撞与射线全部走探针。
+
+调参表：
+
+| 配置 | 默认 | 作用 |
+| --- | --- | --- |
+| `m4.probe.resolution` | 0.10 | 体素边长（米）。10 cm 能分辨椅子腿和门框；超大碎片调到 0.2 省一半时间。 |
+| `m4.probe.max_voxels` | 1_500_000 | 体素总数上限。装不下就自动加粗边长（×1.15），**烘焙成本由它决定**（每体素约 10–20 µs）。 |
+| `m4.probe.clearance_cap` | 1.00 | 距离截断。规划器不需要知道某点离墙 20 m，只需要知道它不贴着墙。 |
+| `m4.probe.padding` | 0.10 | 包围盒外扩容差（米）。必须 > 0，否则外壳三角面落在网格边界上。 |
+| `m4.probe.resume` | true | 探针比 `.blend` 新就跳过。 |
+| `m4.probe.require_all` | false | `false` 时单场景烘焙失败只记进 `probe_summary.json`，该场景退回 AABB。 |
+| `m4.camera.free_space.source` | `auto` | `auto`/`probe`/`aabb`。旧数据集复现用 `aabb`。 |
+| `m4.camera.free_space.hit_clearance` | 0.10 | 射线“算被挡住”的距离阈值。必须 ≥ 行进步长，否则会穿透。 |
+| `m4.camera.free_space.ray_step_scale` | 0.5 | 行进步长 = 体素边长 × 该系数。 |
+| `m4.camera.free_space.min_node_coverage` | 0.90 | 探针能识别的节点比例下限。低于它就认为探针过期（`probe_stale`），退回 AABB——用别的 `.blend` 烘出来的探针会把每条射线都归错节点。 |
+
+规划摘要里能看到每个场景到底用了哪条路：`stats.free_space.{source,probe_scenes,fallback_scenes,status}`，
+每个 job 的 `free_space_report.source` 也会写下 `probe` 或 `aabb`。
+
+成本参考（`--probe` 开关会在离线基准里打出这两行，测的是**查询**成本，不是烘焙）：
+
+```bash
+python -m datacompose.tools.bench_scene_cameras --probe --cameras 8
+# pose_evaluation=196.21 ms         ← AABB：遍历 4625 个盒子
+# probe_pose_evaluation=37.22 ms    ← 探针：查表
+```
+
+探针查询比 AABB 路径**快约 5 倍**（同样的 576 条射线），因为盒子路径每条射线都要跟每个节点求交，
+而探针只查最近体素。烘焙是另一个数量级的开销：`find_nearest` 是逐体素的 Python 循环，
+36 个三角面的玩具场景实测 **1.4 µs/体素**（118 万体素 1.7 s），真实碎片三角面上百万时
+每体素会慢几倍；`max_voxels` 默认 150 万，所以一个场景是**秒到一分钟**量级。
+
+烘焙这条路径没法用单元测试覆盖（要真的 `BVHTree` 和 `.blend`），所以在目标 Blender 上先跑一次冒烟：
+
+```bash
+python tools/probe_smoke_test.py --blender-bin /opt/blender-4.5/blender
+```
+
+它会现场搭一个 10×10×3 的空心房间 + 桌子 + 杯子，烘焙，再拿解析真值校验 clearance /
+射线命中节点 / 地板高度，最后打印 `PASS`。换 Blender 版本、换机器时先跑这个。
+
+### 7.3 软判据（默认关闭）
+
+两处借鉴 BlenderProc 的“软打分”，都**只记录、不参与判定**，除非显式给权重：
+
+| 配置 | 默认 | 作用 |
+| --- | --- | --- |
+| `m4.camera.coverage_weight` | 0.0 | `coverage`（类别多样性 − 单物占比）加进位姿评分的系数。 |
+| `m4.camera.min_coverage` | 0.0 | `coverage` 硬门槛。非 0 时新增一条 `low_scene_coverage` 拒绝。 |
+| `m4.camera.target.azimuth_novelty_weight` | 0.0 | 同一目标的机位按“与已选方位角的角距”加权排序。**不是**硬门槛。 |
+
+三者默认 0，所以接受/拒绝结果与旧数据集一致；每个位姿的 `coverage` / `azimuth_novelty`
+始终会算出来并写进 metrics，可以直接看分布再决定要不要打开。
+
+关于许可：本节与 `probes.py` / `blender/probe_scene.py` 只借鉴 BlenderProc 的**思路**
+（用真实几何校验候选、用覆盖度打分、用位姿新颖度排序），没有复制其代码——BlenderProc 是
+GPL-3.0，抄进来会把整条管线一起传染。
 
 坐标相关的检查集中在 `datacompose/tests/test_coordinates.py`：
 

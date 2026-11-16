@@ -33,6 +33,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import math
 import random
 from pathlib import Path
@@ -40,6 +41,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from .probes import PROBE_FORMAT, ProbeVolume
 from .scene_targets import (
     SceneTarget,
     TargetSpec,
@@ -50,6 +52,9 @@ from .scene_targets import (
     screen_bbox_ratio,
     select_targets,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 SCENE_CAMERA_CONTRACT_VERSION = "1"
@@ -120,6 +125,62 @@ class ContainerSpec:
 
 
 @dataclass(frozen=True)
+class FreeSpaceSpec:
+    """Which geometry oracle decides whether a pose is free.
+
+    ``aabb`` is the original broad-phase model and stays bit-for-bit
+    reproducible.  ``probe`` uses a baked triangle clearance field
+    (:mod:`datacompose.probes`), which is the exact answer the renderer will
+    check, so a pose accepted here is not rejected later.  ``auto`` uses a probe
+    when one exists for the scene and falls back to AABBs otherwise - that is
+    the intended default, because it lets a partially baked dataset still plan.
+    """
+
+    source: str = "auto"  # auto | probe | aabb
+    #: A view ray counts as stopped when it passes this close to a surface.
+    hit_clearance: float = 0.10
+    #: Ray march step, as a fraction of the probe voxel size.
+    ray_step_scale: float = 0.5
+    #: Share of the scene's node ids a probe must know before it is trusted.
+    #: A probe baked from a different ``.blend`` would silently mis-attribute
+    #: every hit, so a stale probe is rejected instead of used.
+    min_node_coverage: float = 0.90
+
+    @property
+    def uses_probe(self) -> bool:
+        return str(self.source) in {"auto", "probe"}
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source": str(self.source),
+            "hit_clearance": float(self.hit_clearance),
+            "ray_step_scale": float(self.ray_step_scale),
+            "min_node_coverage": float(self.min_node_coverage),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any] | None) -> "FreeSpaceSpec":
+        source: Mapping[str, Any] = value or {}
+        defaults = cls()
+        model = str(source.get("source", defaults.source))
+        if model not in {"auto", "probe", "aabb"}:
+            raise ValueError(
+                f"m4.camera.free_space.source is not implemented: {model!r} "
+                "(expected auto, probe or aabb)"
+            )
+        return cls(
+            source=model,
+            hit_clearance=float(source.get("hit_clearance", defaults.hit_clearance)),
+            ray_step_scale=float(
+                source.get("ray_step_scale", defaults.ray_step_scale)
+            ),
+            min_node_coverage=float(
+                source.get("min_node_coverage", defaults.min_node_coverage)
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class CameraSpec:
     """Camera search contract for one scene-only sample."""
 
@@ -150,6 +211,12 @@ class CameraSpec:
     max_near_fraction: float = 0.25
     max_single_node_fraction: float = 0.90
     min_depth_spread_ratio: float = 1.35
+    # Soft "does the frame show several things" score (a BlenderProc idea:
+    # category diversity plus a penalty for one object eating the frame).  It is
+    # recorded on every pose and only *acts* when a weight/floor is configured.
+    coverage_weight: float = 0.0  # added to the pose score
+    min_coverage: float = 0.0  # hard floor; 0 disables the extra rejection
+    free_space: FreeSpaceSpec = FreeSpaceSpec()
 
     # Strategy.  ``scene_free_space_v1`` is the original planner and stays
     # bit-for-bit reproducible; ``entity_conditioned_v1`` frames a named target
@@ -195,6 +262,9 @@ class CameraSpec:
             "max_near_fraction": float(self.max_near_fraction),
             "max_single_node_fraction": float(self.max_single_node_fraction),
             "min_depth_spread_ratio": float(self.min_depth_spread_ratio),
+            "coverage_weight": float(self.coverage_weight),
+            "min_coverage": float(self.min_coverage),
+            "free_space": self.free_space.as_dict(),
             "attempts_per_camera": int(self.attempts_per_camera),
             "min_camera_spacing": float(self.min_camera_spacing),
             "strategy": self.strategy,
@@ -215,6 +285,16 @@ class CameraSpec:
 # --------------------------------------------------------------------------- #
 # Free space
 # --------------------------------------------------------------------------- #
+def node_categories(scene: dict[str, Any]) -> dict[str, str]:
+    """``node_id -> entity category`` from ``scene.json`` (empty when unknown)."""
+    mapping: dict[str, str] = {}
+    for entity in scene.get("entities", []) or []:
+        category = str(entity.get("category") or "")
+        for node_id in entity.get("node_ids", []) or []:
+            mapping[str(node_id)] = category
+    return mapping
+
+
 def detect_containers(
     mins: np.ndarray, maxs: np.ndarray, spec: ContainerSpec | None = None
 ) -> np.ndarray:
@@ -273,6 +353,7 @@ class FreeSpace:
         maxs: np.ndarray,
         node_ids: Sequence[str],
         containers: Sequence[bool] | np.ndarray | None = None,
+        categories: Sequence[str] | None = None,
     ) -> None:
         if mins.shape != maxs.shape or mins.ndim != 2 or mins.shape[1] != 3:
             raise ValueError("free-space bounds must be (N, 3) arrays")
@@ -288,7 +369,18 @@ class FreeSpace:
             if flag.shape != (len(self.mins),):
                 raise ValueError("container flags must have one entry per box")
         self.containers = flag
+        self.categories = list(categories or [""] * len(self.mins))
+        if len(self.categories) != len(self.mins):
+            raise ValueError("category labels must have one entry per box")
         self.volume = np.prod(np.maximum(self.maxs - self.mins, 0.0), axis=1)
+
+    @property
+    def node_count(self) -> int:
+        return len(self.node_ids)
+
+    @property
+    def source(self) -> str:
+        return "aabb"
 
     # -- construction -------------------------------------------------------
     @classmethod
@@ -321,7 +413,14 @@ class FreeSpace:
         flags = detect_containers(
             np.array(mins, dtype=np.float64), np.array(maxs, dtype=np.float64), spec
         )
-        return cls(np.array(mins), np.array(maxs), node_ids, flags)
+        mapping = node_categories(scene)
+        return cls(
+            np.array(mins),
+            np.array(maxs),
+            node_ids,
+            flags,
+            [mapping.get(node_id, "") for node_id in node_ids],
+        )
 
     # -- queries ------------------------------------------------------------
     @property
@@ -500,6 +599,189 @@ class FreeSpace:
         return depth, index
 
 
+class ProbeFreeSpace:
+    """Free space from a baked triangle clearance field (see :mod:`.probes`).
+
+    Drop-in replacement for :class:`FreeSpace` on the query side: the pose
+    evaluators only call :meth:`clearance`, :meth:`raycast`,
+    :meth:`container_at` and :meth:`outside_room`, and the geometry ones are
+    answered from real surfaces here.
+
+    What stays on the AABB side, and why:
+
+    * **Collision, clearance and ray hits** come from the probe.  This is the
+      whole point: a point 2 m inside a room reports a 2 m clearance and a ray
+      from inside hits the far wall without any "is this box hollow" guess, so
+      the failure modes of the rectangle model (L-shaped rooms, multi-storey
+      fragments) disappear.
+    * **Which node is the environment** still comes from ``coarse`` (the
+      :class:`FreeSpace` built from ``scene.json``).  Dominance has to exclude
+      the room shell, or every interior view where all rays end on the walls
+      would read as "one object fills the frame".  Getting that guess slightly
+      wrong is now harmless: positions are already verified free by the probe,
+      so a mis-detected shell can only cost a diagnostic number.
+
+    Positions are also sampled from the field rather than from a random 3-D box,
+    so the sampler never spends its budget on candidates inside a wall.
+    """
+
+    def __init__(
+        self,
+        probe: ProbeVolume,
+        coarse: FreeSpace,
+        *,
+        hit_clearance: float = 0.10,
+        step_scale: float = 0.5,
+    ) -> None:
+        self.probe = probe
+        self.coarse = coarse
+        self.node_ids = list(coarse.node_ids)
+        index = {node_id: position for position, node_id in enumerate(self.node_ids)}
+        self._node_map = np.array(
+            [index.get(node_id, -1) for node_id in probe.node_ids], dtype=np.int64
+        )
+        self.categories = list(coarse.categories)
+        self.containers = coarse.containers
+        self.hit_clearance = float(hit_clearance)
+        self.step_scale = float(step_scale)
+
+    # -- metadata ----------------------------------------------------------
+    @property
+    def node_count(self) -> int:
+        return len(self.node_ids)
+
+    @property
+    def source(self) -> str:
+        return "probe"
+
+    @property
+    def node_coverage(self) -> float:
+        """Share of the scene's nodes the probe can attribute a hit to."""
+        if not self.node_ids:
+            return 0.0
+        known = sum(1 for value in self._node_map if value >= 0)
+        return known / float(len(self.node_ids))
+
+    @property
+    def bbox(self) -> tuple[list[float], list[float]]:
+        return self.probe.bounds
+
+    @property
+    def container_node_ids(self) -> list[str]:
+        return self.coarse.container_node_ids
+
+    def container_at(self, point: Sequence[float]) -> int:
+        return self.coarse.container_at(point)
+
+    def primary_container(self) -> int:
+        return self.coarse.primary_container()
+
+    def outside_room(self, point: Sequence[float]) -> bool:
+        return self.coarse.outside_room(point)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "source": "probe",
+            "format": PROBE_FORMAT,
+            "resolution": self.probe.resolution,
+            "voxels": self.probe.voxel_count,
+            "node_coverage": self.node_coverage,
+        }
+
+    # -- queries -----------------------------------------------------------
+    def clearance(self, points: Sequence[Sequence[float]]) -> np.ndarray:
+        return self.probe.clearance_at(points)
+
+    def inside(self, point: Sequence[float], *, tolerance: float = 0.0) -> np.ndarray:
+        # Kept for API parity with ``FreeSpace``; the probe never needs it.
+        return np.zeros(len(np.asarray(point).reshape(-1, 3)), dtype=bool)
+
+    def nearby_mask(self, point: Sequence[float], radius: float) -> np.ndarray:
+        # The march is already bounded by ``max_distance`` and by the probe
+        # extent, so there is nothing to cull.
+        return np.ones(1, dtype=bool)
+
+    def raycast(
+        self,
+        origin: Sequence[float],
+        directions: np.ndarray,
+        *,
+        max_distance: float,
+        mask: np.ndarray | None = None,
+        chunk_rows: int = 64,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        depth, raw = self.probe.cast(
+            origin,
+            directions,
+            max_distance=float(max_distance),
+            threshold=self.hit_clearance,
+            step_scale=self.step_scale,
+        )
+        mapped = np.where(
+            raw >= 0,
+            self._node_map[np.clip(raw, 0, max(len(self._node_map) - 1, 0))],
+            -1,
+        ) if len(self._node_map) else np.full(len(raw), -1, dtype=np.int64)
+        return depth, np.asarray(mapped, dtype=np.int64)
+
+    # -- sampling ----------------------------------------------------------
+    def sample_position(
+        self, rng: random.Random, spec: "CameraSpec"
+    ) -> tuple[list[float] | None, str | None]:
+        """A verified-free position at standing height, or a reject reason."""
+        eye_height = (
+            tuple(float(value) for value in spec.eye_height)
+            if spec.height_policy == "floor_standing"
+            else None
+        )
+        position = self.probe.random_position(
+            rng,
+            clearance=float(spec.camera_radius),
+            eye_height=eye_height,
+            height_tolerance=self.probe.resolution * 1.5,
+        )
+        if position is None:
+            return None, "no_free_space_position"
+        return position, None
+
+
+# --------------------------------------------------------------------------- #
+# Coverage
+# --------------------------------------------------------------------------- #
+def view_coverage(
+    counts: np.ndarray, categories: Sequence[str]
+) -> dict[str, float]:
+    """How much *stuff* a frame shows, beyond "a lot of surface".
+
+    A wall corner can fill every ray and still be a bad sample.  Two cheap
+    signals separate it from a room view: how many distinct categories are
+    visible (diversity) and whether one object eats the frame (dominance).
+    This mirrors the intent of BlenderProc's ``scene_coverage_score`` without
+    copying it; the number is always recorded, and only influences acceptance
+    when ``CameraSpec.min_coverage`` / ``coverage_weight`` are non-zero.
+    """
+    values = np.asarray(counts, dtype=np.float64)
+    total = float(values.sum())
+    if total <= 0.0:
+        return {"objects": 0.0, "categories": 0.0, "dominance": 0.0, "coverage": 0.0}
+    per_category: dict[str, float] = {}
+    for index, value in enumerate(values):
+        if value <= 0.0:
+            continue
+        label = str(categories[index]) if index < len(categories) else ""
+        per_category[label or "unknown"] = per_category.get(label or "unknown", 0.0) + value
+    objects = float((values > 0.0).sum())
+    distinct = float(len(per_category))
+    dominance = max(per_category.values()) / total
+    diversity = min(distinct / 4.0, 1.0)
+    return {
+        "objects": objects,
+        "categories": distinct,
+        "dominance": dominance,
+        "coverage": 0.6 * diversity + 0.4 * (1.0 - dominance),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Camera geometry
 # --------------------------------------------------------------------------- #
@@ -646,7 +928,9 @@ def evaluate_pose(
     if near_fraction > spec.max_near_fraction:
         return {"ok": False, "reason": "closeup_single_surface", "metrics": metrics}
 
-    counts = np.bincount(box_index[hits], minlength=len(free_space.mins))
+    counts = np.bincount(
+        box_index[hits & (box_index >= 0)], minlength=free_space.node_count
+    )
     if container >= 0:
         # The room is the environment, not "one object filling the frame": all
         # rays in an interior view end on the shell, so counting it would make
@@ -662,6 +946,15 @@ def evaluate_pose(
     )
     if dominance > spec.max_single_node_fraction:
         return {"ok": False, "reason": "single_node_dominates", "metrics": metrics}
+
+    coverage = view_coverage(
+        np.where(free_space.containers, 0.0, counts), free_space.categories
+    )
+    metrics["coverage"] = coverage["coverage"]
+    metrics["coverage_categories"] = coverage["categories"]
+    metrics["coverage_objects"] = coverage["objects"]
+    if float(spec.min_coverage) > 0.0 and coverage["coverage"] < float(spec.min_coverage):
+        return {"ok": False, "reason": "low_scene_coverage", "metrics": metrics}
 
     low = float(np.percentile(hit_depths, 10.0))
     high = float(np.percentile(hit_depths, 90.0))
@@ -682,6 +975,7 @@ def evaluate_pose(
         - 0.5 * near_fraction
         + 0.35 * min(math.log(max(spread, 1.0)), math.log(6.0)) / math.log(6.0)
         + 0.15 * min(clearance / max(spec.near_clearance, 1e-6), 2.0) / 2.0
+        + float(spec.coverage_weight) * coverage["coverage"]
     )
     return {"ok": True, "reason": None, "metrics": metrics}
 
@@ -851,7 +1145,9 @@ def evaluate_target_pose(
         if minimum < spec.near_clearance:
             return {"ok": False, "reason": "near_geometry_in_view", "metrics": metrics}
         near_fraction = float(np.mean(other_depths < spec.near_window))
-        counts = np.bincount(box_index[others], minlength=len(free_space.mins))
+        counts = np.bincount(
+            box_index[others & (box_index >= 0)], minlength=free_space.node_count
+        )
         if container >= 0:
             # The shell is the room; counting it as "the dominant object" would
             # reject every legitimate interior framing.
@@ -874,6 +1170,7 @@ def evaluate_target_pose(
         metrics["minimum_hit_depth"] = minimum
         near_fraction = 0.0
         dominance = 0.0
+        counts = np.zeros(free_space.node_count, dtype=np.int64)
         low = high = minimum
         spread = float("inf")
         metrics["dominant_node_id"] = target.node_ids[0] if target.node_ids else None
@@ -882,12 +1179,20 @@ def evaluate_target_pose(
     metrics["depth_p10"] = low
     metrics["depth_p90"] = high
     metrics["depth_spread_ratio"] = spread
+    coverage = view_coverage(
+        np.where(free_space.containers, 0.0, counts), free_space.categories
+    )
+    metrics["coverage"] = coverage["coverage"]
+    metrics["coverage_categories"] = coverage["categories"]
+    metrics["coverage_objects"] = coverage["objects"]
     if near_fraction > spec.max_near_fraction_targeted:
         return {"ok": False, "reason": "closeup_single_surface", "metrics": metrics}
     if dominance > spec.max_single_node_fraction:
         return {"ok": False, "reason": "single_node_dominates", "metrics": metrics}
     if math.isfinite(spread) and spread < spec.min_depth_spread_ratio:
         return {"ok": False, "reason": "depth_spread_too_small", "metrics": metrics}
+    if float(spec.min_coverage) > 0.0 and coverage["coverage"] < float(spec.min_coverage):
+        return {"ok": False, "reason": "low_scene_coverage", "metrics": metrics}
 
     # -- anchor: the target centre, so canonical.origin is a real place -----
     anchor_depth = float(
@@ -901,6 +1206,7 @@ def evaluate_target_pose(
         - 0.50 * near_fraction
         - 0.30 * dominance
         + 0.10 * metrics["hit_fraction"]
+        + float(spec.coverage_weight) * coverage["coverage"]
     )
     return {"ok": True, "reason": None, "metrics": metrics}
 
@@ -936,6 +1242,7 @@ def sample_camera_poses(
     existing: Iterable[Sequence[float]] = (),
     targets: Sequence[SceneTarget] = (),
     min_target_screen_ratio: float | None = None,
+    probe: "ProbeFreeSpace | None" = None,
 ) -> dict[str, Any]:
     """Search ``count`` collision-free camera poses inside one scene.
 
@@ -944,10 +1251,16 @@ def sample_camera_poses(
     When ``targets`` and ``min_target_screen_ratio`` are supplied, a pose is only
     kept if at least one target reaches that on-screen size - so even the
     room-level wide shots cannot degenerate into a bare wall corner.
+
+    ``probe`` switches the oracle from boxes to real triangles: positions come
+    from the clearance field (free *and* standing above a surface) and the gates
+    are evaluated against it, while the AABB model is still built as the coarse
+    layer the docs describe.
     """
     if count < 1:
         raise ValueError("count must be positive")
     free_space = FreeSpace.from_scene(scene, spec.container)
+    oracle = probe if probe is not None else free_space
     low, high = free_space.bbox
     rng = random.Random(_seed_for(seed, str(scene.get("scene_id", "scene")), "camera"))
     # Two-stage gate: a cheap ray grid rejects most poses, and only survivors are
@@ -955,17 +1268,28 @@ def sample_camera_poses(
     coarse_spec = replace(spec, ray_grid=max(3, min(spec.search_ray_grid, spec.ray_grid)))
     floors = _floor_boxes(scene, free_space)
     # Where "the floor" comes from, in priority order:
+    #   0. the probe: a column of free voxels starts where the clearance first
+    #      exceeds the threshold, so the run a candidate belongs to *is* its
+    #      floor - which is what makes multi-storey fragments work;
     #   1. an entity the extractor already labelled floor/ground/road/...;
     #   2. the bottom face of the room shell - the floor of an imported interior
     #      is part of the shell mesh, so there is no floor *entity* indoors and
     #      the old code silently fell through to the free band;
     #   3. a clamped free band (outdoor / floorless fragments).
     room = free_space.primary_container()
-    use_floor_policy = spec.height_policy == "floor_standing" and len(floors) > 0
-    use_room_floor = (
-        spec.height_policy == "floor_standing" and not use_floor_policy and room >= 0
+    use_probe = probe is not None
+    use_floor_policy = (
+        not use_probe and spec.height_policy == "floor_standing" and len(floors) > 0
     )
-    if use_floor_policy:
+    use_room_floor = (
+        not use_probe
+        and spec.height_policy == "floor_standing"
+        and not use_floor_policy
+        and room >= 0
+    )
+    if use_probe:
+        floor_source, floor_z = "probe", None
+    elif use_floor_policy:
         floor_source, floor_z = "support_categories", None
     elif use_room_floor:
         floor_source, floor_z = "room_shell", float(free_space.mins[room, 2])
@@ -978,43 +1302,50 @@ def sample_camera_poses(
     budget = int(count) * max(1, int(spec.attempts_per_camera)) * 4
     while len(accepted) < count and attempts < budget:
         attempts += 1
-        if use_room_floor:
-            # Sample inside the room footprint: the fragment bbox may be larger
-            # than the room, and a point outside the walls is not a camera pose.
-            x = rng.uniform(float(free_space.mins[room, 0]), float(free_space.maxs[room, 0]))
-            y = rng.uniform(float(free_space.mins[room, 1]), float(free_space.maxs[room, 1]))
-        else:
-            x = rng.uniform(low[0], high[0])
-            y = rng.uniform(low[1], high[1])
-        if use_floor_policy:
-            tops = free_space.maxs[floors, 2]
-            selected = np.nonzero(
-                (free_space.mins[floors, 0] <= x)
-                & (free_space.maxs[floors, 0] >= x)
-                & (free_space.mins[floors, 1] <= y)
-                & (free_space.maxs[floors, 1] >= y)
-            )[0]
-            if not len(selected):
-                result_rejects.append({"reason": "no_floor_under_candidate", "location": [x, y, None]})
+        if use_probe:
+            location, reason = probe.sample_position(rng, spec)
+            if location is None:
+                result_rejects.append({"reason": reason, "location": [None, None, None]})
                 continue
-            foot = float(tops[selected[rng.randrange(len(selected))]])
-            z = foot + rng.uniform(*spec.eye_height)
-        elif use_room_floor:
-            z = float(floor_z) + rng.uniform(*spec.eye_height)
         else:
-            band_low = low[2] + (high[2] - low[2]) * spec.free_height_band[0]
-            band_high = low[2] + (high[2] - low[2]) * spec.free_height_band[1]
-            if spec.container.active:
-                # A whole-building bbox reaches 20 m; the free band fraction then
-                # puts cameras above the roof, staring at sky.
-                clamp_low = low[2] + float(spec.free_height_clamp[0])
-                clamp_high = low[2] + float(spec.free_height_clamp[1])
-                band_low = max(band_low, clamp_low)
-                band_high = min(band_high, clamp_high)
-                if band_high <= band_low:
-                    band_low = band_high = clamp_low
-            z = rng.uniform(band_low, band_high)
-        location = [x, y, z]
+            if use_room_floor:
+                # Sample inside the room footprint: the fragment bbox may be
+                # larger than the room, and a point outside the walls is not a
+                # camera pose.
+                x = rng.uniform(float(free_space.mins[room, 0]), float(free_space.maxs[room, 0]))
+                y = rng.uniform(float(free_space.mins[room, 1]), float(free_space.maxs[room, 1]))
+            else:
+                x = rng.uniform(low[0], high[0])
+                y = rng.uniform(low[1], high[1])
+            if use_floor_policy:
+                tops = free_space.maxs[floors, 2]
+                selected = np.nonzero(
+                    (free_space.mins[floors, 0] <= x)
+                    & (free_space.maxs[floors, 0] >= x)
+                    & (free_space.mins[floors, 1] <= y)
+                    & (free_space.maxs[floors, 1] >= y)
+                )[0]
+                if not len(selected):
+                    result_rejects.append({"reason": "no_floor_under_candidate", "location": [x, y, None]})
+                    continue
+                foot = float(tops[selected[rng.randrange(len(selected))]])
+                z = foot + rng.uniform(*spec.eye_height)
+            elif use_room_floor:
+                z = float(floor_z) + rng.uniform(*spec.eye_height)
+            else:
+                band_low = low[2] + (high[2] - low[2]) * spec.free_height_band[0]
+                band_high = low[2] + (high[2] - low[2]) * spec.free_height_band[1]
+                if spec.container.active:
+                    # A whole-building bbox reaches 20 m; the free band fraction then
+                    # puts cameras above the roof, staring at sky.
+                    clamp_low = low[2] + float(spec.free_height_clamp[0])
+                    clamp_high = low[2] + float(spec.free_height_clamp[1])
+                    band_low = max(band_low, clamp_low)
+                    band_high = min(band_high, clamp_high)
+                    if band_high <= band_low:
+                        band_low = band_high = clamp_low
+                z = rng.uniform(band_low, band_high)
+            location = [x, y, z]
         if spec.min_camera_spacing > 0.0 and taken:
             nearest = min(
                 math.dist(location, other) for other in taken
@@ -1024,12 +1355,12 @@ def sample_camera_poses(
                 continue
         yaw = rng.uniform(*spec.yaw_degrees)
         pitch = rng.uniform(*spec.pitch_degrees)
-        verdict = evaluate_pose(free_space, location, yaw, pitch, coarse_spec)
+        verdict = evaluate_pose(oracle, location, yaw, pitch, coarse_spec)
         if not verdict["ok"]:
             result_rejects.append({"reason": verdict["reason"], "location": location})
             continue
         if coarse_spec.ray_grid != spec.ray_grid:
-            verdict = evaluate_pose(free_space, location, yaw, pitch, spec)
+            verdict = evaluate_pose(oracle, location, yaw, pitch, spec)
             if not verdict["ok"]:
                 result_rejects.append(
                     {"reason": f"final_gate:{verdict['reason']}", "location": location}
@@ -1068,8 +1399,17 @@ def sample_camera_poses(
         "floor_nodes": int(len(floors)),
         "floor_source": floor_source,
         "floor_z": None if floor_z is None else float(floor_z),
-        "height_policy": "floor_standing" if (use_floor_policy or use_room_floor) else "free",
+        "height_policy": (
+            "floor_standing"
+            if (
+                use_floor_policy
+                or use_room_floor
+                or (use_probe and spec.height_policy == "floor_standing")
+            )
+            else "free"
+        ),
         "rooms": free_space.container_node_ids,
+        "free_space_source": oracle.source,
         "camera_z_percentiles": _percentiles(z_values),
     }
     return {"accepted": accepted[:count], "rejects": result_rejects, "stats": stats}
@@ -1137,12 +1477,18 @@ def sample_targeted_poses(
     seed: int,
     count: int,
     existing: Iterable[Sequence[float]] = (),
+    probe: "ProbeFreeSpace | None" = None,
 ) -> dict[str, Any]:
     """Orbit ``count`` cameras around the scene's best framable targets.
 
     Structure mirrors :func:`sample_camera_poses` so callers can treat both the
     same.  The extra ``targets`` key carries the chosen :class:`SceneTarget`
     objects for reuse (e.g. the room-level wide shots must still contain one).
+
+    ``probe`` re-validates every candidate orbit position against real triangles
+    instead of boxes, which is what stops the "planner says free, renderer says
+    inside a wall" waste.  The AABB model is still built: it drives the coarse
+    orbit-radius cap, which only needs an upper bound.
     """
     if count < 1:
         raise ValueError("count must be positive")
@@ -1175,6 +1521,7 @@ def sample_targeted_poses(
             "stats": stats_empty,
             "targets": [],
         }
+    oracle = probe if probe is not None else free_space
     room = free_space.primary_container()
     floor_z = float(free_space.mins[room, 2]) if room >= 0 else None
     target_report: dict[str, Any] = {}
@@ -1256,16 +1603,27 @@ def sample_targeted_poses(
                     {"reason": "camera_too_close_to_other_camera", "location": location}
                 )
                 continue
-        if separation > 0.0:
-            previous = used_azimuths.get(target.entity_id, [])
-            if any(
-                abs(((azimuth - other + 180.0) % 360.0) - 180.0) < separation
-                for other in previous
-            ):
-                result_rejects.append(
-                    {"reason": "camera_azimuth_too_close", "location": location}
-                )
-                continue
+        # Angular novelty: how far this azimuth is from the ones already used for
+        # this target, normalised to [0, 1].  BlenderProc's ``check_novel_pose``
+        # idea - prefer poses that add information - expressed as a ranking term
+        # rather than another hard gate, and inert unless a weight is set.
+        previous = used_azimuths.get(target.entity_id, [])
+        novelty = (
+            1.0
+            if not previous
+            else min(
+                abs(((azimuth - other + 180.0) % 360.0) - 180.0) for other in previous
+            )
+            / 180.0
+        )
+        if separation > 0.0 and any(
+            abs(((azimuth - other + 180.0) % 360.0) - 180.0) < separation
+            for other in previous
+        ):
+            result_rejects.append(
+                {"reason": "camera_azimuth_too_close", "location": location}
+            )
+            continue
         to_center = [-(location[axis] - float(target.center[axis])) for axis in range(3)]
         yaw, pitch_degrees = look_angles(to_center)
         if spec.target.look_jitter_degrees > 0.0:
@@ -1273,7 +1631,7 @@ def sample_targeted_poses(
             yaw += rng.uniform(-jitter, jitter)
             pitch_degrees += rng.uniform(-jitter, jitter)
         verdict = evaluate_target_pose(
-            free_space,
+            oracle,
             target,
             location,
             yaw,
@@ -1286,9 +1644,19 @@ def sample_targeted_poses(
                 {"reason": verdict["reason"], "location": location}
             )
             continue
+        verdict["metrics"]["azimuth_novelty"] = novelty
         accepted.append(verdict["metrics"])
         used_azimuths.setdefault(target.entity_id, []).append(azimuth)
-    accepted.sort(key=lambda row: (-float(row["score"]), row["location"]))
+    novelty_weight = float(spec.target.azimuth_novelty_weight)
+    accepted.sort(
+        key=lambda row: (
+            -(
+                float(row["score"])
+                + novelty_weight * float(row.get("azimuth_novelty", 0.0))
+            ),
+            row["location"],
+        )
+    )
     z_values = sorted(float(row["location"][2]) for row in accepted)
     stats = {
         "attempts": attempts,
@@ -1299,13 +1667,14 @@ def sample_targeted_poses(
         "reject_reasons": _count_reasons(result_rejects),
         "nodes": len(free_space.node_ids),
         "floor_nodes": 0,
-        "floor_source": "room_shell" if room >= 0 else "none",
+        "floor_source": "probe" if probe is not None else ("room_shell" if room >= 0 else "none"),
         "floor_z": floor_z,
         "height_policy": "entity_orbit",
         "targets": len(targets),
         "target_ids": [target.entity_id for target in targets],
         "targets_report": target_report,
         "rooms": free_space.container_node_ids,
+        "free_space_source": oracle.source,
         "camera_z_percentiles": _percentiles(z_values),
     }
     return {
@@ -1341,6 +1710,7 @@ def build_camera_job(
     license_block: dict[str, Any] | None = None,
     source_scene_digest: str = "",
     schema_version: str = "1.0",
+    free_space_source: str = "aabb",
 ) -> dict[str, Any]:
     location = [float(value) for value in metrics["location"]]
     forward = [float(value) for value in metrics["forward"]]
@@ -1433,6 +1803,10 @@ def build_camera_job(
             "container_node_ids": [
                 str(value) for value in metrics.get("container_node_ids") or []
             ],
+            # Which oracle accepted this pose: "probe" (real triangles) or
+            # "aabb" (broad phase).  Recorded so a dataset can be traced back to
+            # the model that produced it.
+            "source": str(free_space_source),
         },
         "lineage": {
             "blend_digest": base_scene_digest,
@@ -1509,12 +1883,15 @@ def _sample_scene_cameras(
     *,
     seed: int,
     count: int,
+    probe: "ProbeFreeSpace | None" = None,
 ) -> dict[str, Any]:
     """Dispatch on ``spec.strategy`` and merge both halves into one result."""
     if spec.strategy != "entity_conditioned_v1":
-        return sample_camera_poses(scene, spec, seed=seed, count=count)
+        return sample_camera_poses(scene, spec, seed=seed, count=count, probe=probe)
     targeted_count, free_count = camera_count_split(count, spec.mix_with_free_space)
-    targeted = sample_targeted_poses(scene, spec, seed=seed, count=targeted_count)
+    targeted = sample_targeted_poses(
+        scene, spec, seed=seed, count=targeted_count, probe=probe
+    )
     free: dict[str, Any] = {
         "accepted": [],
         "rejects": [],
@@ -1538,6 +1915,7 @@ def _sample_scene_cameras(
             count=free_count,
             targets=targeted["targets"],
             min_target_screen_ratio=spec.target.min_target_screen_ratio,
+            probe=probe,
         )
     accepted = list(targeted["accepted"]) + list(free["accepted"])
     accepted.sort(key=lambda row: (-float(row["score"]), row["location"]))
@@ -1571,6 +1949,9 @@ def _sample_scene_cameras(
         if targeted["stats"].get("floor_z") is not None
         else free["stats"].get("floor_z"),
         "targets_report": targeted["stats"].get("targets_report") or {},
+        "free_space_source": targeted["stats"].get("free_space_source")
+        or free["stats"].get("free_space_source")
+        or "aabb",
         "camera_z_percentiles": free["stats"].get("camera_z_percentiles")
         or targeted["stats"].get("camera_z_percentiles"),
     }
@@ -1595,6 +1976,7 @@ def build_scene_camera_jobs(
     license_policy_version: str = "unconfigured",
     require_all_scenes: bool = True,
     project_root: Path | str | None = None,
+    probe_by_scene: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Plan camera jobs for every scene in a ``scene.json`` document.
 
@@ -1602,6 +1984,12 @@ def build_scene_camera_jobs(
     ``project_root`` must be supplied to resolve and hash it; falling back to the
     process CWD would record a digest for the wrong file when the planner is
     launched from another directory.
+
+    ``probe_by_scene`` maps ``scene_id`` to a baked probe (a
+    :class:`~datacompose.probes.ProbeVolume` or a path to ``.probe.npz``).  With
+    ``m4.camera.free_space.source = auto`` a probe is used when present and the
+    AABB model otherwise, so a partially baked dataset still plans and an
+    unbaked one reproduces the old behaviour exactly.
     """
     spec = spec or CameraSpec()
     profile = lighting_profile or {
@@ -1619,9 +2007,11 @@ def build_scene_camera_jobs(
     }
     scenes = sorted(scene_document.get("scenes", []), key=lambda row: row["scene_id"])
     root = (Path(project_root).expanduser() if project_root is not None else Path.cwd()).resolve()
+    probes = dict(probe_by_scene or {})
     jobs: list[dict[str, Any]] = []
     rejects: list[dict[str, Any]] = []
     per_scene: dict[str, Any] = {}
+    probe_status: dict[str, str] = {}
     blend_digests: dict[Path, str] = {}
     for scene in scenes:
         scene_id = str(scene["scene_id"])
@@ -1653,14 +2043,18 @@ def build_scene_camera_jobs(
             for entity in scene.get("entities", [])
             if str(entity.get("category", "")) in fixtures
         )
+        oracle, status = _build_probe_oracle(
+            scene, spec, probes.get(scene_id), root=root
+        )
+        probe_status[scene_id] = status
         try:
             search = _sample_scene_cameras(
-                scene, spec, seed=seed, count=cameras_per_scene
+                scene, spec, seed=seed, count=cameras_per_scene, probe=oracle
             )
         except ValueError as error:
             rejects.append({"scene_id": scene_id, "reason": "unusable_scene_bounds", "detail": str(error)})
             continue
-        per_scene[scene_id] = search["stats"]
+        per_scene[scene_id] = {**search["stats"], "probe": status}
         if not search["accepted"]:
             rejects.append(
                 {
@@ -1684,6 +2078,9 @@ def build_scene_camera_jobs(
                     lighting_profile=profile,
                     fixture_entity_ids=fixture_ids,
                     license_block=license_block,
+                    free_space_source=str(
+                        search["stats"].get("free_space_source") or "aabb"
+                    ),
                 )
             )
     jobs.sort(key=lambda row: row["job_id"])
@@ -1702,12 +2099,73 @@ def build_scene_camera_jobs(
             "scenes_without_camera": sum(1 for scene_id in per_scene if not per_scene[scene_id]["accepted"])
             + sum(1 for row in rejects if row["reason"] == "unusable_scene_bounds"),
             "jobs": len(jobs),
+            # Which oracle every scene actually used, so a "no pose" report can
+            # be read without re-running the planner.
+            "free_space": {
+                "source": str(spec.free_space.source),
+                "probe_scenes": sorted(
+                    scene_id for scene_id, value in probe_status.items() if value == "probe"
+                ),
+                "fallback_scenes": sorted(
+                    scene_id for scene_id, value in probe_status.items() if value != "probe"
+                ),
+                "status": dict(sorted(probe_status.items())),
+            },
             "per_scene": per_scene,
         },
     }
     if require_all_scenes and not jobs:
         raise RuntimeError("scene camera planning produced zero jobs")
     return document
+
+
+def _build_probe_oracle(
+    scene: dict[str, Any],
+    spec: CameraSpec,
+    entry: Any,
+    *,
+    root: Path,
+) -> tuple["ProbeFreeSpace | None", str]:
+    """Load a scene's probe and wrap it as an oracle, or explain why not.
+
+    The returned status is a short stable string (``probe``, ``no_probe``,
+    ``probe_missing``, ``probe_unreadable``, ``probe_stale``, ``source_aabb``)
+    that lands in the planning summary.
+    """
+    if not spec.free_space.uses_probe:
+        return None, "source_aabb"
+    if entry is None:
+        return None, "no_probe"
+    try:
+        coarse = FreeSpace.from_scene(scene, spec.container)
+    except ValueError:
+        # No usable bounds: planning will reject the scene as before.
+        return None, "no_scene_bounds"
+    try:
+        volume = entry if isinstance(entry, ProbeVolume) else ProbeVolume.load(
+            Path(entry) if Path(str(entry)).is_absolute() else (root / str(entry))
+        )
+    except FileNotFoundError:
+        return None, "probe_missing"
+    except (OSError, ValueError, KeyError) as error:
+        LOGGER.warning("Ignoring unusable probe for %s: %s", scene.get("scene_id"), error)
+        return None, "probe_unreadable"
+    oracle = ProbeFreeSpace(
+        volume,
+        coarse,
+        hit_clearance=float(spec.free_space.hit_clearance),
+        step_scale=float(spec.free_space.ray_step_scale),
+    )
+    if oracle.node_coverage < float(spec.free_space.min_node_coverage):
+        # A probe baked from another blend would attribute every hit to the
+        # wrong node; a low overlap means the probe is stale.
+        LOGGER.warning(
+            "Probe for %s only covers %.0f%% of its nodes; falling back to AABBs",
+            scene.get("scene_id"),
+            100.0 * oracle.node_coverage,
+        )
+        return None, "probe_stale"
+    return oracle, "probe"
 
 
 def load_scene_document(path: str) -> dict[str, Any]:
@@ -1719,6 +2177,8 @@ __all__ = [
     "CameraSpec",
     "ContainerSpec",
     "FreeSpace",
+    "FreeSpaceSpec",
+    "ProbeFreeSpace",
     "build_camera_job",
     "build_scene_camera_jobs",
     "blender_rotation_euler",
@@ -1728,8 +2188,10 @@ __all__ = [
     "evaluate_pose",
     "evaluate_target_pose",
     "load_scene_document",
+    "node_categories",
     "sample_camera_poses",
     "sample_targeted_poses",
     "target_screen_metrics",
+    "view_coverage",
     "view_directions",
 ]

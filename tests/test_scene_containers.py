@@ -390,6 +390,61 @@ class DefaultConfigTest(unittest.TestCase):
             self.assertIn(key, target)
         self.assertIn("free_height_clamp", self.camera)
 
+    def test_every_configured_free_space_key_exists(self) -> None:
+        from dataclasses import fields
+
+        from datacompose.scene_cameras import FreeSpaceSpec
+
+        known = {field.name for field in fields(FreeSpaceSpec)}
+        block = self.camera.get("free_space") or {}
+        self.assertTrue(block, "m4.camera.free_space must be documented")
+        for key in block:
+            self.assertIn(key, known)
+        # Every dataclass field must be settable from the config, otherwise the
+        # default silently wins over what the file says.
+        self.assertEqual(known - set(block), set())
+
+    def test_every_configured_probe_key_exists(self) -> None:
+        from dataclasses import fields
+
+        from datacompose.probes import ProbeSpec
+
+        known = {field.name for field in fields(ProbeSpec)}
+        block = self.config.section("m4").get("probe") or {}
+        self.assertTrue(block, "m4.probe must be documented")
+        for key in block:
+            self.assertIn(key, known)
+        # ``require_all``/``resume`` are booleans the launcher can override, but
+        # every value still has to have a default in the file.
+        self.assertEqual(known - set(block), set())
+
+    def test_probe_defaults_are_neutral(self) -> None:
+        """The new stage must not change a dataset unless someone opts in."""
+        from datacompose.probes import ProbeSpec
+        from datacompose.scene_cameras import CameraSpec, FreeSpaceSpec
+        from datacompose.scene_targets import TargetSpec
+
+        spec = FreeSpaceSpec.from_mapping(self.camera.get("free_space"))
+        self.assertEqual(spec.source, "auto")
+        self.assertEqual(spec, FreeSpaceSpec())
+        self.assertEqual(
+            float(self.camera.get("coverage_weight", -1.0)), float(CameraSpec().coverage_weight)
+        )
+        self.assertEqual(
+            float(self.camera.get("min_coverage", -1.0)), float(CameraSpec().min_coverage)
+        )
+        self.assertEqual(
+            float(
+                self.camera["target"].get(
+                    "azimuth_novelty_weight", -1.0
+                )
+            ),
+            float(TargetSpec().azimuth_novelty_weight),
+        )
+        self.assertEqual(
+            ProbeSpec.from_mapping(self.config.section("m4").get("probe")), ProbeSpec()
+        )
+
 
 class JobReportTest(unittest.TestCase):
     """The renderer needs the container node ids to skip shell dominance."""

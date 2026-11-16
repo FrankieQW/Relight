@@ -139,6 +139,7 @@ class LauncherTest(unittest.TestCase):
     def test_launcher_scripts_exist_for_every_stage(self) -> None:
         expected = {
             "prepare_scenes.py": "prepare-scenes",
+            "probe_scenes.py": "probe-scenes",
             "plan_scene_cameras.py": "plan-scene-cameras",
             "render_dataset.py": "render",
             "clear_render_partial.py": "clear-render-partial",

@@ -108,6 +108,10 @@ class TargetSpec:
     # and the 1.5 m spacing rejects the whole orbit after the first camera.
     # Set to 0 to allow duplicates.
     min_azimuth_separation_degrees: float = 15.0
+    # Ranking term (not a gate): how much a pose's angular distance from the
+    # azimuths already accepted for that target is worth. 0 keeps the old
+    # pure-score ordering; raise it to spread cameras around the subject.
+    azimuth_novelty_weight: float = 0.0
     look_jitter_degrees: float = 0.0
     attempts_per_target: int = 200
 
@@ -149,6 +153,7 @@ class TargetSpec:
             "min_azimuth_separation_degrees": float(
                 self.min_azimuth_separation_degrees
             ),
+            "azimuth_novelty_weight": float(self.azimuth_novelty_weight),
             "look_jitter_degrees": float(self.look_jitter_degrees),
             "attempts_per_target": int(self.attempts_per_target),
             "surface_samples": int(self.surface_samples),
@@ -216,6 +221,9 @@ class TargetSpec:
                     "min_azimuth_separation_degrees",
                     defaults.min_azimuth_separation_degrees,
                 )
+            ),
+            azimuth_novelty_weight=float(
+                source.get("azimuth_novelty_weight", defaults.azimuth_novelty_weight)
             ),
             look_jitter_degrees=float(
                 source.get("look_jitter_degrees", defaults.look_jitter_degrees)

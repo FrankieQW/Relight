@@ -19,6 +19,7 @@ import time
 from datacompose.scene_cameras import (
     CameraSpec,
     FreeSpace,
+    ProbeFreeSpace,
     _sample_scene_cameras,
     evaluate_pose,
 )
@@ -91,6 +92,52 @@ def synthetic_scene(node_count: int = 4000, *, size: float = 200.0, seed: int = 
     }
 
 
+def _hall_probe(scene: dict, *, resolution: float):
+    """A clearance field for the scene bounding box, for query-cost timing.
+
+    This is deliberately *not* a bake: it is the distance to the six faces of
+    the scene bbox, so the only thing it measures is how expensive the
+    probe-backed query path is per pose.  Cheaper than a real bake by orders of
+    magnitude, and enough to answer "does the probe path cost more per pose than
+    the AABB path?".
+    """
+    import numpy as np
+
+    from datacompose.probes import ProbeVolume
+
+    lows = np.array(
+        [node["aabb_world"]["min"] for node in scene["nodes"] if node.get("aabb_world")],
+        dtype=np.float64,
+    )
+    highs = np.array(
+        [node["aabb_world"]["max"] for node in scene["nodes"] if node.get("aabb_world")],
+        dtype=np.float64,
+    )
+    low = lows.min(axis=0)
+    high = highs.max(axis=0)
+    dims = tuple(int(value) for value in np.ceil((high - low) / resolution))
+    axes = [
+        low[axis] + (np.arange(dims[axis], dtype=np.float64) + 0.5) * resolution
+        for axis in range(3)
+    ]
+    field = np.full(dims, np.inf)
+    for axis in range(3):
+        shaped = axes[axis].reshape(
+            [-1 if index == axis else 1 for index in range(3)]
+        )
+        field = np.minimum(field, shaped - low[axis])
+        field = np.minimum(field, high[axis] - shaped)
+    cap = 1.0
+    return ProbeVolume(
+        origin=low,
+        resolution=resolution,
+        clearance=np.minimum(field, cap).astype(np.float32),
+        nearest_node=np.zeros(dims, dtype=np.int32),
+        node_ids=["walls"],
+        clearance_cap=cap,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nodes", type=int, default=4000)
@@ -103,6 +150,12 @@ def main() -> None:
         choices=["scene_free_space_v1", "entity_conditioned_v1"],
         help="camera planner to benchmark",
     )
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="also time the probe-backed query path (query cost only, not a bake)",
+    )
+    parser.add_argument("--probe-resolution", type=float, default=1.0)
     args = parser.parse_args()
 
     scene = synthetic_scene(args.nodes)
@@ -125,6 +178,29 @@ def main() -> None:
         evaluate_pose(space, [0.0, 0.0, 1.6], 37.0, -5.0, spec)
     per_pose = (time.perf_counter() - start) / 200.0
     print(f"pose_evaluation={per_pose * 1000:.2f} ms  (ray_grid={args.ray_grid} -> {args.ray_grid ** 2} rays)")
+
+    if args.probe:
+        start = time.perf_counter()
+        probe = _hall_probe(scene, resolution=args.probe_resolution)
+        hall_seconds = time.perf_counter() - start
+        oracle = ProbeFreeSpace(probe, space, hit_clearance=0.10, step_scale=0.5)
+        start = time.perf_counter()
+        for _ in range(200):
+            evaluate_pose(oracle, [0.0, 0.0, 1.6], 37.0, -5.0, spec)
+        probe_pose = (time.perf_counter() - start) / 200.0
+        start = time.perf_counter()
+        for _ in range(200):
+            oracle.sample_position(random.Random(0), spec)
+        probe_sample = (time.perf_counter() - start) / 200.0
+        print(
+            f"probe: voxels={probe.voxel_count} resolution={probe.resolution} "
+            f"field_build={hall_seconds:.2f} s (analytic hall, not a bake)"
+        )
+        print(
+            f"probe_pose_evaluation={probe_pose * 1000:.2f} ms "
+            f"probe_position_sample={probe_sample * 1000:.2f} ms "
+            f"(same {args.ray_grid ** 2} rays)"
+        )
 
     start = time.perf_counter()
     result = _sample_scene_cameras(scene, spec, seed=1, count=args.cameras)

@@ -1,9 +1,9 @@
 """Command-line entry points for the scene-only pipeline.
 
-Stages: ``prepare-scenes`` → ``plan-scene-cameras`` → ``render``.
-Each stage is also runnable as a plain script through the thin launchers in this
-directory (``python prepare_scenes.py``), which call :func:`main` with the stage
-name already filled in.
+Stages: ``prepare-scenes`` → ``probe-scenes`` (optional) → ``plan-scene-cameras``
+→ ``render``.  Each stage is also runnable as a plain script through the thin
+launchers in this directory (``python prepare_scenes.py``), which call
+:func:`main` with the stage name already filled in.
 
 Third-party imports are deferred into :func:`main`, so ``--help`` and a single
 stage only need that stage's dependencies.
@@ -45,6 +45,19 @@ def main(argv: list[str] | None = None) -> None:
         )
         _print_summary("scene", result)
         return
+    if args.command == "probe-scenes":
+        from .scene_probe import probe_scenes
+
+        resume = None if args.resume is None else bool(args.resume)
+        result = probe_scenes(
+            config,
+            blender_bin=args.blender_bin,
+            workers=args.workers,
+            resume=resume,
+            scene_json=args.scene_json,
+        )
+        _print_summary("scene_probes", result)
+        return
     if args.command == "plan-scene-cameras":
         result = _plan_scene_cameras(config, args)
         _print_summary("scene_camera_jobs", result)
@@ -72,9 +85,11 @@ def main(argv: list[str] | None = None) -> None:
 
 def _plan_scene_cameras(config, args) -> dict[str, Any]:
     from .io_utils import dump_json_atomic, dump_jsonl_atomic
+    from .probes import discover_probes, load_probes
     from .scene_cameras import (
         CameraSpec,
         ContainerSpec,
+        FreeSpaceSpec,
         build_scene_camera_jobs,
         load_scene_document,
     )
@@ -82,6 +97,7 @@ def _plan_scene_cameras(config, args) -> dict[str, Any]:
 
     m4 = config.section("m4")
     camera = m4.get("camera", {}) or {}
+    free_space = FreeSpaceSpec.from_mapping(camera.get("free_space"))
     spec = CameraSpec(
         focal_length=float(camera.get("focal_length", 50.0)),
         yaw_degrees=tuple(float(v) for v in camera.get("yaw_degrees", [0.0, 360.0])),
@@ -115,6 +131,9 @@ def _plan_scene_cameras(config, args) -> dict[str, Any]:
         max_near_fraction_targeted=float(
             camera.get("max_near_fraction_targeted", 0.85)
         ),
+        coverage_weight=float(camera.get("coverage_weight", 0.0)),
+        min_coverage=float(camera.get("min_coverage", 0.0)),
+        free_space=free_space,
         target=TargetSpec.from_mapping(camera.get("target")),
     )
     if spec.strategy not in {"scene_free_space_v1", "entity_conditioned_v1"}:
@@ -128,8 +147,16 @@ def _plan_scene_cameras(config, args) -> dict[str, Any]:
         else m4.get("cameras_per_scene", 32)
     )
     scene_path = Path(args.scene_json).resolve() if args.scene_json else config.path("scene_output")
+    scene_document = load_scene_document(str(scene_path))
+    # Probes are optional: `free_space.source: aabb` (or a missing probe) keeps
+    # the AABB plan, which is what reproducing an old dataset needs.
+    probes = (
+        load_probes(discover_probes(scene_document, project_root=config.root))
+        if free_space.uses_probe
+        else {}
+    )
     document = build_scene_camera_jobs(
-        load_scene_document(str(scene_path)),
+        scene_document,
         spec=spec,
         seed=int(args.seed if args.seed is not None else config.section("project").get("seed", 0)),
         cameras_per_scene=cameras_per_scene,
@@ -137,6 +164,7 @@ def _plan_scene_cameras(config, args) -> dict[str, Any]:
         base_scene_license=m4.get("base_scene_license", {}),
         license_policy_version=str(m4.get("license_policy_version", "unconfigured")),
         project_root=config.root,
+        probe_by_scene=probes,
     )
     max_jobs = m4.get("max_render_jobs")
     jobs = document["jobs"]
@@ -189,6 +217,18 @@ def _build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--output", default=None, help="Defaults to paths.render_jobs_output")
     plan.add_argument("--cameras-per-scene", type=int, default=None)
     plan.add_argument("--seed", type=int, default=None)
+
+    probes = subparsers.add_parser(
+        "probe-scenes",
+        help="Bake scene meshes into clearance probes for exact free-space planning",
+    )
+    _common_arguments(probes)
+    probes.add_argument("--blender-bin", default=None)
+    probes.add_argument("--workers", type=int, default=None)
+    probes.add_argument("--scene-json", default=None, help="Defaults to paths.scene_output")
+    probe_resume = probes.add_mutually_exclusive_group()
+    probe_resume.add_argument("--resume", action="store_true", dest="resume", default=None)
+    probe_resume.add_argument("--no-resume", action="store_false", dest="resume")
 
     render = subparsers.add_parser(
         "render", help="Render TokenLight components for the planned cameras"

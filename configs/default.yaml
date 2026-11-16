@@ -105,6 +105,14 @@ m4:
     max_near_fraction: 0.25
     max_single_node_fraction: 0.90
     min_depth_spread_ratio: 1.35
+    # How much a frame's *content* is worth beyond "a lot of surface": category
+    # diversity minus a penalty for one object eating the frame. Always
+    # recorded on a pose (`coverage`); 0 keeps it purely diagnostic, which is
+    # what reproducing an old dataset needs.
+    coverage_weight: 0.0
+    # Hard floor on that score. 0 disables the extra `low_scene_coverage`
+    # rejection; ~0.45 rejects a frame that is one flat surface and nothing else.
+    min_coverage: 0.0
     attempts_per_camera: 32
     min_camera_spacing: 1.50
 
@@ -132,6 +140,27 @@ m4:
       # the real wall distance; this margin keeps the renderer from rejecting a
       # pose the planner accepted.
       clearance_margin: 0.10
+
+    # Which geometry oracle decides whether a pose is free.
+    #   auto  - use a baked probe when the scene has one, else AABBs (default).
+    #   probe - same, but records the fallback loudly in the planning summary.
+    #   aabb  - the original rectangle model only: bit-for-bit reproduction of
+    #           a dataset planned before probes existed.
+    # The box model is a broad phase: it overestimates every object, so it can
+    # accept a pose the renderer then rejects inside a wall. A probe answers
+    # from real triangles (see `probe-scenes`), which is the same test the
+    # Blender worker will run.
+    free_space:
+      source: auto
+      # A view ray counts as stopped by a surface when it passes this close to
+      # one (metres). Keep it >= the probe march step so nothing is tunnelled.
+      hit_clearance: 0.10
+      # Ray march step as a fraction of the probe voxel size.
+      ray_step_scale: 0.5
+      # Share of the scene's node ids a probe must recognise before it is
+      # trusted; a probe baked from a different .blend would mis-attribute
+      # every ray hit, so a stale one falls back to AABBs instead.
+      min_node_coverage: 0.90
 
     # Camera strategy.
     #   scene_free_space_v1     - original planner: random free-space positions.
@@ -221,6 +250,10 @@ m4:
       # most 1.2 m apart and a 1.5 m spacing allows exactly one camera. Set to
       # 0 to allow duplicate angles.
       min_azimuth_separation_degrees: 15.0
+      # Ranking term (not a gate): how much the angular distance from the
+      # azimuths already accepted for the same target is worth. 0 keeps the
+      # old pure-score ordering; ~0.3 spreads cameras around the subject.
+      azimuth_novelty_weight: 0.0
       # Extra aim slop away from the exact subject centre (0 keeps the target
       # exactly on the optical axis, which the manifest contract assumes).
       look_jitter_degrees: 0.0
@@ -253,6 +286,31 @@ m4:
       thin_occluder_thickness: 0.01
   # Entities treated as scene-native light fixtures when in view.
   fixture_categories: [lamp, lantern, light, chandelier, sconce]
+  # --- probe-scenes: bake real geometry for exact free-space planning ------
+  # Stage `probe-scenes` runs Blender once per scene and writes
+  # `<scene_id>.probe.npz` next to the normalised .blend: a voxel field of the
+  # exact distance to the nearest triangle plus the node that owns it. Planning
+  # then samples positions and casts view rays against real surfaces instead of
+  # rectangles, which removes the "planner accepts, renderer rejects" waste.
+  # The stage is optional: without a probe the planner falls back to AABBs.
+  probe:
+    enabled: true
+    # Voxel edge in metres. 10 cm resolves a chair leg and a door frame; raise
+    # it to halve the bake time on huge fragments.
+    resolution: 0.10
+    # Hard cap on nx*ny*nz. The resolution is coarsened until the grid fits, so
+    # this is the real knob for bake cost (~10-20 us per voxel).
+    max_voxels: 1500000
+    # Distances are clipped here; the planner never needs to know that a point
+    # is 20 m from a wall, only that it is not 0.2 m from one.
+    clearance_cap: 1.00
+    # Extra margin around the scene bounding box, in metres.
+    padding: 0.10
+    workers: 1
+    resume: true
+    # true = fail the stage if any scene cannot be baked. false = record the
+    # failure and let that scene plan from AABBs.
+    require_all: false
   camera_gate:
     camera_radius: 0.20
     near_clearance: 0.30

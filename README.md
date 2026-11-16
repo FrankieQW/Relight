@@ -15,12 +15,18 @@ cd <本项目目录>                                # 就是包含这些脚本�
 # 1) FBX → 归一化 .blend + scene.json
 python prepare_scenes.py --blender-bin /opt/blender-4.5/blender
 
+# 1.5) （可选但强烈建议）把场景烘焙成三角面距离场探针
+python probe_scenes.py --blender-bin /opt/blender-4.5/blender --workers 4
+
 # 2) 在每个场景里规划"视野无穿插"的相机
 python plan_scene_cameras.py --cameras-per-scene 32
 
 # 3) 按相机 + 光照渲染 TokenLight 分量
 python render_dataset.py --blender-bin /opt/blender-4.5/blender --workers 2
 ```
+
+第 1.5 步是可选的：没有探针时规划器自动退回 AABB 宽相模型，行为与旧版本一致。
+一个场景烘焙失败也只影响它自己（记进 `probe_summary.json`，该场景退回 AABB）。
 
 失败重跑时，用 `--clear-failed` 一次性清掉本批失败留下的 partial（只清带 `failure.json`、且没有已完成产物的那些）：
 
@@ -37,6 +43,7 @@ python render_dataset.py --clear-failed --blender-bin /opt/blender-4.5/blender
 | 脚本 | 作用 | 主要输出 |
 |---|---|---|
 | `prepare_scenes.py` | FBX → 归一化 `.blend` + 场景图 | `paths.scene_output` |
+| `probe_scenes.py` | （可选）场景烘焙成三角面距离场探针 | `<scene_id>.probe.npz`（在 `.blend` 旁） |
 | `plan_scene_cameras.py` | 场景内自由空间相机采样（≥30% 拒绝率正常） | `paths.render_jobs_output` |
 | `render_dataset.py` | 调 Blender 渲染分量 + metadata | `paths.tokenlight_output` |
 | `clear_render_partial.py` | 人工确认后清理失败 partial | — |
@@ -56,7 +63,7 @@ python prepare_scenes.py --blender-bin /opt/blender-4.5/blender
 ## 相机是怎么定的
 
 `scene_cameras.py`（纯 numpy，不需要 Blender）在场景里采样位姿，并用 `scene.json` 的 node AABB
-做宽相判据：
+做宽相判据（有探针时改用真实的三角面距离场，见下面「精确几何：探针」）：
 
 - 相机不在几何体内（`camera_radius`）；
 - 视锥射线最小命中深度 ≥ `near_clearance` —— **这就是"视野里不穿模"**；
@@ -101,6 +108,39 @@ category。把 `m4.camera.container.model` 设成 `aabb_legacy` 即恢复旧的�
 室内地板通常就在壳体网格里，所以地板来源优先级是：floor 类实体 → 容器底面 → 高度带 + 绝对值钳制
 （`m4.camera.free_height_clamp`）。
 
+### 精确几何：探针（`probe-scenes`）
+
+上面两条路径（AABB / 空心容器）都还在**猜**几何。`probe-scenes` 把猜测换成实测：用 Blender 把整个
+场景的三角面烘焙成一个体素距离场，存成 `.blend` 旁边的 `<scene_id>.probe.npz`，
+存的是“到最近三角面的距离”与“那个三角面属于哪个节点”。
+
+规划时因此变成：
+
+- 相机位置从**已验证自由的体素列**里采样，并按“体素列的下边界”推出脚下地板（多层建筑天然正确）；
+- 视野射线打在同一份距离场上，命中节点来自真实三角面；
+- 不需要内外判定——距离场对墙体两侧对称，“离所有三角面都够远”本身就排除了在几何体里。
+
+```bash
+python probe_scenes.py --blender-bin /opt/blender-4.5/blender --workers 4   # 烘焙
+python plan_scene_cameras.py --cameras-per-scene 32                        # 自动使用
+```
+
+`m4.camera.free_space.source` 三档：`auto`（有探针就用，默认）、`probe`、`aabb`（完全不用探针，
+旧数据集逐字节复现）。探针查询比 AABB 路径**快约 5 倍**（同样 576 条射线：37 ms vs 196 ms），
+因为盒子路径每条射线要和每个节点求交，而探针只查最近体素；代价是烘焙（36 面的玩具场景实测
+1.4 µs/体素，真实碎片更慢，`max_voxels` 默认上限 150 万 → 单场景秒到一分钟）。细节与调参见 `GUID.md` 7.2。
+
+探针查询是**保守下界**：实测只会低估（13 cm 体素平均低估 6 cm），不会高估，所以它带来的误拒
+比误收常见——嫌拒太多就把 `m4.probe.resolution` 调小。烘焙代码没法单元测试，换 Blender 版本
+先跑一次冒烟：
+
+```bash
+python tools/probe_smoke_test.py --blender-bin /opt/blender-4.5/blender
+```
+
+两处借鉴 BlenderProc 的**软判据**（`coverage_weight` / `min_coverage` / `azimuth_novelty_weight`）
+默认全为 0：只记录、不参与接受/拒绝，所以打开它们之前数据集不会有任何变化。
+
 ## 光照
 
 - 环境光：`m4.render.hdri_root` 指向 `.hdr/.exr` 目录（每个样本确定性抽一张），留空则用常色；
@@ -127,6 +167,8 @@ python -m unittest discover -s tests -p 'test_*.py'
 取景（墙角场景产不出相机、目标可见性/画面占比、遮挡与接触容差、混采分配）；
 `tests/test_scene_containers.py` 覆盖空心容器模型（容器检测、室内 clearance/raycast、`aabb_legacy`
 复现、地板来源优先级、目标几何过滤与排序、轴平行射线回归）以及配置键与代码字段的一致性；
+`tests/test_scene_probe.py` 覆盖探针（距离场数值、`npz` 往返、查询是保守下界、`cast` 命中与节点归属、
+`support_z` 推地板、多层建筑、软判据、规划侧四种探针状态，以及用假 Blender 替身端到端跑 `probe-scenes`）；
 `tests/test_launcher.py` 覆盖脚本化运行方式；
 `tests/test_coordinates.py`、`test_manifest_camera.py`、`test_intrinsic_passes.py` 覆盖坐标/分量契约。
 
