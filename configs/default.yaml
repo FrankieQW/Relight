@@ -89,6 +89,12 @@ m4:
     pitch_degrees: [-18.0, 12.0]
     eye_height: [1.10, 1.80]
     height_policy: floor_standing
+    # Fallback height band, used only when neither a floor entity nor a room
+    # shell exists (outdoor fragments). It is a fraction of the scene bbox, so
+    # on a whole-building bbox it can reach 8 m; ``free_height_clamp`` (metres
+    # above the bbox floor) is what keeps cameras at eye level.
+    free_height_band: [0.05, 0.90]
+    free_height_clamp: [1.00, 2.50]
     camera_radius: 0.20
     near_clearance: 0.30
     max_depth: 45.0
@@ -101,6 +107,31 @@ m4:
     min_depth_spread_ratio: 1.35
     attempts_per_camera: 32
     min_camera_spacing: 1.50
+
+    # Room / building shells are *hollow*, not solid.
+    # An imported interior often arrives as one mesh whose AABB spans the whole
+    # room. Under a solid-box free-space model every eye-height point is then
+    # "inside geometry" and a ray from inside never hits the shell, so the room
+    # produces no poses at all. Marking such a box hollow makes clearance mean
+    # "distance to the nearest wall" and makes rays hit the opposite wall.
+    container:
+      #   container_v1 - detect hollow shells (see the three conditions below)
+      #   aabb_legacy  - the original solid-box model; use this to reproduce an
+      #                  old dataset exactly.
+      model: container_v1
+      # All three axes must be at least this large (metres) - a table is 0.75 m
+      # tall and a wardrobe 1.0 m deep, so neither can be mistaken for a room.
+      min_extent: 2.0
+      # Cubic metres; rejects a tall thin pillar or a doorway gap.
+      min_volume: 8.0
+      # The AABB must enclose at least this many other node centres: a solid
+      # crate encloses nothing, a furnished room encloses the furniture.
+      min_contained_nodes: 1
+      # Extra wall distance demanded inside a container (metres). The AABB is a
+      # rectangle approximation of a possibly L-shaped room, so it overestimates
+      # the real wall distance; this margin keeps the renderer from rejecting a
+      # pose the planner accepted.
+      clearance_margin: 0.10
 
     # Camera strategy.
     #   scene_free_space_v1     - original planner: random free-space positions.
@@ -127,16 +158,48 @@ m4:
       max_targets_per_scene: 4
       # Candidates whose AABBs overlap more than this are counted once.
       duplicate_iou: 0.80
-      # Never treat these as subjects; they are the "wall corner" failure mode.
+      # Never treat these as subjects. This list is a cheap early reject, not
+      # the real filter: categories are classifier output (a "street" comes back
+      # as a 0.60-confidence fallback string), so the geometric filters below
+      # are what actually keep streets, doormats and building shells out.
       ignore_categories:
         - building
         - ceiling
+        - curb
         - floor
+        - grass
         - ground
+        - pavement
+        - plaza
         - road
         - sidewalk
         - sky
+        - street
+        - terrain
         - wall
+        - water
+      # --- geometric filters (independent of category) ---------------------
+      # A subject has three real dimensions. These three numbers reject the
+      # "wall corner" and "street" failure modes whatever the classifier said.
+      # Shortest AABB axis below this = a sheet (doormat, road surface).
+      min_thickness: 0.03
+      # shortest/longest below this = a plane, not an object.
+      flat_ratio: 0.06
+      # Longest AABB axis above this = terrain, not something to frame.
+      max_dimension: 4.00
+      # ...and a target may not span most of the scene either (catches a thin
+      # but kilometres-long merged fragment).
+      max_scene_diagonal_fraction: 0.50
+      # --- ranking ---------------------------------------------------------
+      # Candidates are scored, not sorted by size: "largest first" always picks
+      # the street. ``framability_score`` rewards a longest axis near
+      # ``sweet_dimension`` (metres), three-dimensional volume, and being above
+      # the floor; it penalises support surfaces (floors, tables, rugs).
+      sweet_dimension: 0.50
+      support_surface_penalty: 0.15
+      prefer_above_floor: 0.10
+      # "On the floor" tolerance used by the above-floor bonus (metres).
+      floor_band: 0.02
       # Orbit radius: r = radius_scale * half_diagonal, clamped, then jittered.
       # 2.6 with a 50 mm lens puts a cube-like object at roughly 40-60% of frame
       # width; lower it for tighter product shots, raise it for more context.
@@ -144,10 +207,20 @@ m4:
       min_radius: 0.60
       max_radius: 6.00
       radius_jitter: [0.85, 1.50]
+      # The orbit radius is also capped by the distance to the nearest obstacle;
+      # this is the floor of that cap as a fraction of the natural radius, so a
+      # target in a corner is not forced into a 0.6 m face-to-face shot.
+      min_radius_fraction: 0.70
       # Elevation of the camera around the subject (degrees; + is above).
       pitch_degrees: [-10.0, 45.0]
       azimuth_samples: 12
       azimuth_jitter_degrees: 15.0
+      # Minimum angular separation between two accepted cameras of the same
+      # target. Distance spacing (``min_camera_spacing``) cannot work on an
+      # orbit: a 12 cm cup is orbited at ~0.6 m, so every pair of poses is at
+      # most 1.2 m apart and a 1.5 m spacing allows exactly one camera. Set to
+      # 0 to allow duplicate angles.
+      min_azimuth_separation_degrees: 15.0
       # Extra aim slop away from the exact subject centre (0 keeps the target
       # exactly on the optical axis, which the manifest contract assumes).
       look_jitter_degrees: 0.0
@@ -158,7 +231,10 @@ m4:
       min_target_visible_ratio: 0.40
       surface_samples: 64
       # Target gate 2: bounding box of the projected subject, as a share of the
-      # frame. Too small = unreadable, too large = a texture close-up.
+      # frame. Too large = a texture close-up. NOTE: ``min_target_screen_ratio``
+      # is *not* used for filtering any more - with r = radius_scale *
+      # half_diagonal the estimate is ~1.0 for every candidate (the size cancels
+      # out), so it never rejected anything. Ranking is framability_score.
       min_target_screen_ratio: 0.02
       max_target_screen_ratio: 0.75
       # Target gate 3: the subject centre must sit inside this share of frame.

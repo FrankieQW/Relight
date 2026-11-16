@@ -223,6 +223,24 @@ class TargetedSamplingTest(unittest.TestCase):
             exact["metrics"]["target_visible_ratio"],
         )
 
+    def test_small_target_still_yields_several_cameras(self) -> None:
+        """Orbit spacing must be angular.
+
+        A 12 cm cup is orbited at 0.6 m, so two poses are at most 1.2 m apart:
+        a 1.5 m euclidean ``min_camera_spacing`` used to allow exactly one
+        camera per target, which is why a 32-camera scene collapsed to a couple
+        of jobs.
+        """
+        spec = CameraSpec(target=target_spec(), min_camera_spacing=1.50)
+        result = sample_targeted_poses(cup_scene(), spec, seed=3, count=6)
+        self.assertEqual(len(result["accepted"]), 6)
+        self.assertGreater(spec.target.min_azimuth_separation_degrees, 0.0)
+
+    def test_azimuth_separation_can_be_disabled(self) -> None:
+        spec = CameraSpec(target=target_spec(min_azimuth_separation_degrees=0.0))
+        result = sample_targeted_poses(cup_scene(), spec, seed=3, count=4)
+        self.assertNotIn("camera_azimuth_too_close", result["stats"]["reject_reasons"])
+
     def test_pose_behind_a_wall_is_rejected(self) -> None:
         scene = cup_scene()
         spec = CameraSpec(target=target_spec())

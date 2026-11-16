@@ -70,17 +70,36 @@ python prepare_scenes.py --blender-bin /opt/blender-4.5/blender
 
 上面这套判据有个副作用：**两面墙组成的墙角是它的最优解**（没有单一节点占优、深度跨度又大），
 于是会产出"画面里只有墙角、没有物体"的样本。把 `m4.camera.strategy` 切成
-`entity_conditioned_v1` 后，`scene_targets.py` 会先挑出可成景的命名实体（按尺寸、像素预算、
-非建筑类筛，`raw_label` 只做溯源），再在它周围的球壳上取景，并要求：
+`entity_conditioned_v1` 后，`scene_targets.py` 会先挑出可成景的实体，再在它周围的球壳上取景，
+并要求：
 
+- 目标筛选是**几何判据 + 打分排序**：硬过滤扁平度/厚度/最长轴/占场景跨度（挡掉街道、门垫、
+  地形、建筑壳体），再用 `framability_score` 排序。category 只做早期剔除和排序惩罚——分类器
+  输出不够可靠，不能当白名单。
 - `target_visible_ratio`：目标表面样本有多少真正看得见（AABB 射线，带接触容差，
   所以"杯子放在桌上"不算被遮挡）；
-- `target_screen_ratio`：目标投影包围框占画面的比例，太小看不见、太大是糊屏特写；
+- `target_screen_ratio`：目标投影包围框占画面的比例，太大是糊屏特写；
 - 目标中心必须落在画面安全区内；
 - 旧的近裁剪/命中率判据仍然生效，但只统计**非目标**几何，目标本身可以占满画面。
 
-同时保留 `mix_with_free_space`（默认 0.30）比例的远景，远景也必须含一个达标目标，因此
+同时保留 `mix_with_free_space`（默认 0.30）比例的远景，远景也必须含一个真正可见的目标，因此
 不会再出现纯墙角。所有阈值都在 `m4.camera.target` 下，可只改配置、不改代码。
+
+注意绕行取景的机位间隔是**角度**（`target.min_azimuth_separation_degrees`），不是欧氏距离
+（`min_camera_spacing`）：小目标在 0.6 m 轨道上任意两个机位最多相距 1.2 m，用 1.5 m 的间距会让
+一个目标只能出一个机位。
+
+### 室内场景：空心容器模型（`m4.camera.container`）
+
+进口的室内片段常常是**一整块网格**（单个节点，AABB 覆盖整个房间）。在"盒子=实心"的自由空间
+模型里，这种场景里每一个眼高点都算"在几何体内部"，从室内发出的射线也打不到壳体，于是整个房间
+一个相机都规划不出来。`container_v1` 把这种盒子识别为**空心**：`clearance` 变成"到最近墙面的距离"、
+射线命中的是**对面墙**，并且只在相机位于容器内时，容器的命中不计入"单一物体占满画面"。
+
+容器判据纯几何（三轴都 ≥ `min_extent`、体积 ≥ `min_volume`、AABB 内含其它节点中心），不看
+category。把 `m4.camera.container.model` 设成 `aabb_legacy` 即恢复旧的实心盒模型，用来复现旧数据集。
+室内地板通常就在壳体网格里，所以地板来源优先级是：floor 类实体 → 容器底面 → 高度带 + 绝对值钳制
+（`m4.camera.free_height_clamp`）。
 
 ## 光照
 
@@ -106,6 +125,8 @@ python -m unittest discover -s tests -p 'test_*.py'
 
 `tests/test_scene_cameras.py` 覆盖相机判据与确定性；`tests/test_scene_camera_targets.py` 覆盖目标条件化
 取景（墙角场景产不出相机、目标可见性/画面占比、遮挡与接触容差、混采分配）；
+`tests/test_scene_containers.py` 覆盖空心容器模型（容器检测、室内 clearance/raycast、`aabb_legacy`
+复现、地板来源优先级、目标几何过滤与排序、轴平行射线回归）以及配置键与代码字段的一致性；
 `tests/test_launcher.py` 覆盖脚本化运行方式；
 `tests/test_coordinates.py`、`test_manifest_camera.py`、`test_intrinsic_passes.py` 覆盖坐标/分量契约。
 

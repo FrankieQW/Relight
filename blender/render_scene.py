@@ -345,6 +345,13 @@ def _validate_camera_pose(job: dict[str, Any], runtime: dict[str, Any]) -> dict[
         else config.get("max_near_fraction", 0.25)
     )
 
+    # Room/building shells are hollow: from inside, every ray ends on the shell,
+    # so counting it as "one object dominating the frame" would reject every
+    # legitimate interior view. The planner already ignores it for dominance; do
+    # the same here so an accepted pose is not thrown away at render time. The
+    # depths still feed the near-plane and depth-spread gates.
+    container_names = _container_objects(job)
+
     depsgraph = bpy.context.evaluated_depsgraph_get()
     clearance = _camera_clearance(location, camera_radius * 4.0)
     if clearance < camera_radius:
@@ -373,7 +380,8 @@ def _validate_camera_pose(job: dict[str, Any], runtime: dict[str, Any]) -> dict[
             depths.append(depth)
             if obj.name not in target_names:
                 background_depths.append(depth)
-                hits_by_object[obj.name] = hits_by_object.get(obj.name, 0) + 1
+                if obj.name not in container_names:
+                    hits_by_object[obj.name] = hits_by_object.get(obj.name, 0) + 1
 
     total = grid * grid
     hit_fraction = len(depths) / total
@@ -444,6 +452,30 @@ def _validate_camera_pose(job: dict[str, Any], runtime: dict[str, Any]) -> dict[
                 f"(target_visible_ratio={ratio:.3f} < {min_target_visible})"
             )
     return report
+
+
+def _container_objects(job: dict[str, Any]) -> set[str]:
+    """Blender objects that make up the hollow room/building shell, if any.
+
+    ``free_space_report.container_node_ids`` is written by the planner; when it
+    is absent (old jobs, ``aabb_legacy``) this is empty and nothing changes.
+    """
+    node_ids = {
+        str(value)
+        for value in (job.get("free_space_report", {}) or {}).get(
+            "container_node_ids"
+        )
+        or []
+    }
+    if not node_ids:
+        return set()
+    return {
+        obj.name
+        for obj in bpy.data.objects
+        if obj.type == "MESH"
+        and not obj.hide_render
+        and str(obj.get("lc_scene_object_id") or "") in node_ids
+    }
 
 
 def _target_objects(job: dict[str, Any]) -> tuple[set[str], list[Any]]:

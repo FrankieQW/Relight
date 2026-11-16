@@ -72,7 +72,12 @@ def main(argv: list[str] | None = None) -> None:
 
 def _plan_scene_cameras(config, args) -> dict[str, Any]:
     from .io_utils import dump_json_atomic, dump_jsonl_atomic
-    from .scene_cameras import CameraSpec, build_scene_camera_jobs, load_scene_document
+    from .scene_cameras import (
+        CameraSpec,
+        ContainerSpec,
+        build_scene_camera_jobs,
+        load_scene_document,
+    )
     from .scene_targets import TargetSpec
 
     m4 = config.section("m4")
@@ -83,6 +88,13 @@ def _plan_scene_cameras(config, args) -> dict[str, Any]:
         pitch_degrees=tuple(float(v) for v in camera.get("pitch_degrees", [-18.0, 12.0])),
         eye_height=tuple(float(v) for v in camera.get("eye_height", [1.10, 1.80])),
         height_policy=str(camera.get("height_policy", "floor_standing")),
+        free_height_band=tuple(
+            float(v) for v in camera.get("free_height_band", [0.05, 0.90])
+        ),
+        free_height_clamp=tuple(
+            float(v) for v in camera.get("free_height_clamp", [1.00, 2.50])
+        ),
+        container=ContainerSpec.from_mapping(camera.get("container")),
         camera_radius=float(camera.get("camera_radius", 0.20)),
         near_clearance=float(camera.get("near_clearance", 0.30)),
         max_depth=float(camera.get("max_depth", 45.0)),

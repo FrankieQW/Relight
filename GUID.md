@@ -32,7 +32,7 @@ datacompose/
 ├── io_utils.py                 原子写、digest、JSONL
 ├── schemas.py                  Pydantic 数据协议（场景 + 相机 job）
 ├── scene_semantics.py          类别归一化与别名
-├── scene_cameras.py            场景内无碰撞相机采样（AABB 宽相 + 视野无穿插判据）
+├── scene_cameras.py            场景内无碰撞相机采样（AABB 宽相 + 空心容器 + 视野无穿插判据）
 ├── scene_targets.py            目标实体挑选 + 投影/可见性几何（实体条件化取景）
 ├── scene_extract.py            prepare-scenes（调用 blender/entry.py）
 ├── render_scenes.py            render（多 GPU worker 调度 blender/render_scene.py）
@@ -62,7 +62,8 @@ datacompose/
     ├── test_render_recovery.py
     ├── test_launcher.py
     ├── test_scene_cameras.py
-    └── test_scene_camera_targets.py
+    ├── test_scene_camera_targets.py
+    └── test_scene_containers.py
 ```
 
 本目录是**独立可复制的 compose 项目**：只依赖自身代码与本目录下的 `configs/`、`transfer.py`，
@@ -266,6 +267,37 @@ manifest 或外部工具自行恢复。`focal_length` 与 `sensor_width` 只是 
 | `scene_free_space_v1` | 原始策略：在场景自由空间里随机取位置+朝向。默认值，旧数据集可用它逐字节复现。 |
 | `entity_conditioned_v1` | 以命名实体为目标绕球壳取景，并混入 `mix_with_free_space` 比例的远景。 |
 
+**空心容器模型（`m4.camera.container.model`）**：进口的室内场景常常是“一整块网格”（单个节点，
+AABB 覆盖整个房间）。在“盒子=实心”的自由空间模型里，这种场景的每一个眼高点都在几何体内部，
+从室内发出的射线也永远打不到壳体——于是整个房间规划不出任何相机（真实 Bistro 片段实测 4400 次
+尝试 0 通过）。`container_v1` 把这种盒子标记为**空心**，只改变三件事：
+
+1. `clearance`：点在空心盒内时取“到最近一个面的距离”（即到墙的距离），而不是 0；
+2. `raycast`：从空心盒内射出的射线命中的是**对面墙**（出口面），而不是穿过；
+3. dominance：**只当相机位于该容器内**时，容器的命中不计入 `single_node_fraction`
+   （房间是环境，不是“一个占满画面的物体”）。相机在容器外时行为与旧模型完全一致，室外场景不受影响。
+
+容器判据是纯几何的（不看 category，因为 category 只是分类器输出）：三轴都 ≥ `min_extent`、
+体积 ≥ `min_volume`、AABB 内至少含 `min_contained_nodes` 个其它节点中心。把
+`container.model` 设成 `aabb_legacy` 即恢复旧的实心盒模型，用于逐字节复现旧数据集。
+
+> ⚠️ 容器模型**默认开启**，对两种策略都生效（`scene_free_space_v1` 在室内场景上一模一样地坏过）。
+> 因此想复现旧数据集要**同时**确认 `camera.container.model: aabb_legacy` 与
+> `camera.strategy: scene_free_space_v1`；另外修复轴平行射线伪命中（见下）会让结果与旧提交
+> 不是严格逐字节一致，语义上是修正而非回归。
+
+配套的两处修正：
+
+- **`camera_outside_room`**：水平落在某个容器 footprint 内、但垂直超出它的 z 范围时拒绝。
+  这正是“相机飘到屋顶以上看天空”的来源；水平在容器外则放行，保护混合场景的室外部分。
+- **地板来源优先级**：`support_categories` 实体 → 容器 `min_z`（导入室内的地板本身就在壳体网格内，
+  所以室内往往**没有** floor 实体）→ `free_height_band` 配合绝对值钳制 `free_height_clamp`。
+
+目标挑选是**几何判据 + 打分排序**，category 只做早期剔除和排序惩罚，不做白名单：硬过滤
+`min_thickness` / `flat_ratio` / `max_dimension` / `max_scene_diagonal_fraction`，
+排序用 `framability_score`。注意 `min_target_screen_ratio` **不再用于过滤目标**：绕行半径
+`r = radius_scale × 半对角线` 会让尺寸约掉，估计值对所有候选都恒为 ~1.0。
+
 `entity_conditioned_v1` 的 job 会额外写：
 
 ```json
@@ -284,7 +316,11 @@ manifest 或外部工具自行恢复。`focal_length` 与 `sensor_width` 只是 
   "target_radius": 0.104,
   "target_node_ids": ["node_00412"]
 },
-"free_space_report": {"occluder_node_ids": ["node_00007"]},
+"free_space_report": {
+  "occluder_node_ids": ["node_00007"],
+  "room_node_id": "node_00001",
+  "container_node_ids": ["node_00001"]
+},
 "lineage": {"target": {"entity_id": "...", "label": "CoffeeCup_01", "visible_ratio": 0.83, "...": "..."}}
 ```
 
@@ -296,8 +332,10 @@ manifest 或外部工具自行恢复。`focal_length` 与 `sensor_width` 只是 
   因此渲染侧 `anchor_depth` 与点光/面光的距离缩放不需要任何改动。
 - `target_visible_ratio` 是规划阶段的 AABB 可见性估计；渲染侧用真实三角形复核后会写
   `metadata.target.geometry_visible_ratio`，两者不一致时以渲染侧为准。
-- 没有 `target_entity_id` 的 job 表示它是自由空间远景（混采），它的构图门槛是"画面里至少有一个
-  目标达到 `min_target_screen_ratio`"，因此不会是纯墙角。
+- 没有 `target_entity_id` 的 job 表示它是自由空间远景（混采），构图门槛是“画面里至少有一个目标
+  真正可见”，因此不会是纯墙角。
+- `free_space_report.container_node_ids` 会被 `blender/render_scene.py` 用来把容器对象**从 dominance
+  里排除**（仍参与 near plane / depth spread），避免规划器放行、渲染侧 `single_object_dominates` 误拒。
 
 ### 4.2 光源块
 
@@ -468,17 +506,28 @@ python -m unittest discover -s datacompose/tests -p 'test_*.py'
 深度跨度、确定性、与 `coordinates` 契约的一致性）。
 `tests/test_scene_camera_targets.py` 覆盖实体条件化取景：纯墙角场景必须产不出相机、目标可见性与
 画面占比门槛、被完全遮挡的目标被拒、接触容差、30% 混采的分配与 job/schema 契约。
+`tests/test_scene_containers.py` 覆盖空心容器模型：容器检测、室内 clearance/raycast、`outside_room`、
+`aabb_legacy` 复现旧的“室内全灭”、三种地板来源的优先级、目标几何过滤（薄片/超大/跨度）、
+`framability_score` 排序、以及轴平行射线伪命中的回归；同时校验 `configs/default.yaml` 里
+`m4.camera` / `camera.target` / `camera.container` 的键与 dataclass 字段一致（防止配置与代码漂移）。
 
 ### 7.1 相机策略调参
 
 `m4.camera.strategy` 切成 `entity_conditioned_v1` 后，所有阈值都在 `m4.camera.target` 下，改完重跑
-`plan_scene_cameras.py` 即可，不需要改代码。最常动的三个：
+`plan_scene_cameras.py` 即可，不需要改代码。最常动的几个：
 
 | 配置 | 默认 | 作用 |
 | --- | --- | --- |
 | `target.min_target_visible_ratio` | 0.40 | 目标表面有多少比例必须真正看得见。贴桌/贴墙的物体不要调高，调高会只剩悬空物体。 |
 | `target.radius_scale` + `radius_jitter` | 2.6 / `[0.85, 1.50]` | 绕行半径 = `radius_scale × 半对角线`。数值越大越"远景"，越小越"特写"。 |
+| `target.min_radius_fraction` | 0.70 | 靠墙/贴桌的目标不要被“按最近障碍物”的半径上限压到特写，这是该上限的下限比例。 |
+| `target.min_azimuth_separation_degrees` | 15.0 | 同一目标两个机位的最小角度间隔。**绕行取景不能用欧氏间距**：12 cm 的杯子在 0.6 m 轨道上，任意两个机位最多相距 1.2 m，1.5 m 的 `min_camera_spacing` 会让每个目标只能出 1 个机位。 |
 | `mix_with_free_space` | 0.30 | 远景占比。设为 0 就全部是目标特写。 |
+| `target.max_dimension` | 4.00 | 最长轴超过这个（米）就不算可构图目标：挡掉街道、地形、建筑壳体。 |
+| `target.flat_ratio` / `min_thickness` | 0.06 / 0.03 | 扁平度与厚度下限：挡掉门垫、路面这类“片”。 |
+| `camera.container.model` | `container_v1` | 设成 `aabb_legacy` 恢复旧的实心盒模型；旧数据集复现用它。 |
+| `camera.container.clearance_margin` | 0.10 | 室内额外要求的墙距。规划器用矩形近似房间，可能高估墙距，渲染侧因此误拒时可调大。 |
+| `camera.free_height_clamp` | `[1.00, 2.50]` | 无地板、无容器时的高度绝对值钳制，防止相机飞到屋顶以上。 |
 
 调参前先用离线基准跑一遍 reject 分布（无需 Blender）：
 
@@ -488,7 +537,8 @@ python -m datacompose.tools.bench_scene_cameras --strategy entity_conditioned_v1
 
 `reject_reasons` 里 `target_too_large` 偏多说明半径偏小，`target_occluded` 偏多说明
 `min_target_visible_ratio` 太高或遮挡体判得太死，`no_geometry_in_view` 偏多说明
-`min_hit_fraction_targeted` 太高。
+`min_hit_fraction_targeted` 太高，`camera_inside_geometry` 偏多而场景明显是室内时检查
+`camera.container.model` / `min_contained_nodes`（容器没被识别出来）。
 
 坐标相关的检查集中在 `datacompose/tests/test_coordinates.py`：
 

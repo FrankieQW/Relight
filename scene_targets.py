@@ -22,15 +22,26 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 
+# Architecture and terrain: never a subject.  The list is *not* the primary
+# filter (categories are classifier output and can be arbitrary fallback
+# strings); the geometric filters below are.  It only removes the obvious cases
+# early.  ``street`` is the one that used to slip through and get orbited.
 DEFAULT_IGNORE_CATEGORIES = (
     "building",
     "ceiling",
+    "curb",
     "floor",
+    "grass",
     "ground",
+    "pavement",
+    "plaza",
     "road",
     "sidewalk",
     "sky",
+    "street",
+    "terrain",
     "wall",
+    "water",
 )
 
 DEFAULT_IGNORE_AS_OCCLUDER = (
@@ -59,14 +70,44 @@ class TargetSpec:
     duplicate_iou: float = 0.80  # overlapping candidates are counted once
     ignore_categories: tuple[str, ...] = DEFAULT_IGNORE_CATEGORIES
 
+    # -- geometric filters (category independent) --------------------------
+    # A subject has three real dimensions.  These three numbers are what keep a
+    # ``street``, a doormat or a building shell out of the target list even when
+    # the classifier calls them something harmless.
+    min_thickness: float = 0.03  # shortest axis below this = a sheet
+    flat_ratio: float = 0.06  # shortest/longest below this = a plane
+    max_dimension: float = 4.00  # longest axis above this = terrain, not an object
+    # ... and a target may not span most of the scene either (catches a
+    # "street" whose AABB is thin but kilometres long in a merged fragment).
+    max_scene_diagonal_fraction: float = 0.50
+
+    # -- ranking -----------------------------------------------------------
+    # Neither "largest first" (picks the street) nor ``estimated_screen_ratio``
+    # (which is size invariant, see the note in ``select_targets``) can rank
+    # candidates, so ranking is an explicit framability score.
+    sweet_dimension: float = 0.50  # longest axis closest to this ranks highest
+    support_surface_penalty: float = 0.15  # floors/tables rank below props
+    prefer_above_floor: float = 0.10  # centred this far above the floor = bonus
+    floor_band: float = 0.02  # tolerance for "on the floor" (metres)
+
     # -- candidate generation ---------------------------------------------
     radius_scale: float = 2.6  # r = radius_scale * half diagonal
     min_radius: float = 0.60
     max_radius: float = 6.00
     radius_jitter: tuple[float, float] = (0.85, 1.50)
+    # The orbit radius is also capped by the distance to the nearest obstacle;
+    # this is the floor of that cap, as a fraction of the natural radius, so a
+    # target in a corner is not forced into a 0.6 m face-to-face shot.
+    min_radius_fraction: float = 0.70
     pitch_degrees: tuple[float, float] = (-10.0, 45.0)
     azimuth_samples: int = 12
     azimuth_jitter_degrees: float = 15.0
+    # Minimum angular separation between two accepted cameras of the *same*
+    # target.  Distance-based ``min_camera_spacing`` cannot work on an orbit: a
+    # 12 cm cup is orbited at ~0.6 m, so every two poses are at most 1.2 m apart
+    # and the 1.5 m spacing rejects the whole orbit after the first camera.
+    # Set to 0 to allow duplicates.
+    min_azimuth_separation_degrees: float = 15.0
     look_jitter_degrees: float = 0.0
     attempts_per_target: int = 200
 
@@ -89,13 +130,25 @@ class TargetSpec:
             "max_targets_per_scene": int(self.max_targets_per_scene),
             "duplicate_iou": float(self.duplicate_iou),
             "ignore_categories": list(self.ignore_categories),
+            "min_thickness": float(self.min_thickness),
+            "flat_ratio": float(self.flat_ratio),
+            "max_dimension": float(self.max_dimension),
+            "max_scene_diagonal_fraction": float(self.max_scene_diagonal_fraction),
+            "sweet_dimension": float(self.sweet_dimension),
+            "support_surface_penalty": float(self.support_surface_penalty),
+            "prefer_above_floor": float(self.prefer_above_floor),
+            "floor_band": float(self.floor_band),
             "radius_scale": float(self.radius_scale),
             "min_radius": float(self.min_radius),
             "max_radius": float(self.max_radius),
             "radius_jitter": [float(value) for value in self.radius_jitter],
+            "min_radius_fraction": float(self.min_radius_fraction),
             "pitch_degrees": [float(value) for value in self.pitch_degrees],
             "azimuth_samples": int(self.azimuth_samples),
             "azimuth_jitter_degrees": float(self.azimuth_jitter_degrees),
+            "min_azimuth_separation_degrees": float(
+                self.min_azimuth_separation_degrees
+            ),
             "look_jitter_degrees": float(self.look_jitter_degrees),
             "attempts_per_target": int(self.attempts_per_target),
             "surface_samples": int(self.surface_samples),
@@ -124,11 +177,32 @@ class TargetSpec:
                 str(item)
                 for item in source.get("ignore_categories", defaults.ignore_categories)
             ),
+            min_thickness=float(source.get("min_thickness", defaults.min_thickness)),
+            flat_ratio=float(source.get("flat_ratio", defaults.flat_ratio)),
+            max_dimension=float(source.get("max_dimension", defaults.max_dimension)),
+            max_scene_diagonal_fraction=float(
+                source.get(
+                    "max_scene_diagonal_fraction", defaults.max_scene_diagonal_fraction
+                )
+            ),
+            sweet_dimension=float(
+                source.get("sweet_dimension", defaults.sweet_dimension)
+            ),
+            support_surface_penalty=float(
+                source.get("support_surface_penalty", defaults.support_surface_penalty)
+            ),
+            prefer_above_floor=float(
+                source.get("prefer_above_floor", defaults.prefer_above_floor)
+            ),
+            floor_band=float(source.get("floor_band", defaults.floor_band)),
             radius_scale=float(source.get("radius_scale", defaults.radius_scale)),
             min_radius=float(source.get("min_radius", defaults.min_radius)),
             max_radius=float(source.get("max_radius", defaults.max_radius)),
             radius_jitter=tuple(
                 float(item) for item in source.get("radius_jitter", defaults.radius_jitter)
+            ),
+            min_radius_fraction=float(
+                source.get("min_radius_fraction", defaults.min_radius_fraction)
             ),
             pitch_degrees=tuple(
                 float(item) for item in source.get("pitch_degrees", defaults.pitch_degrees)
@@ -136,6 +210,12 @@ class TargetSpec:
             azimuth_samples=int(source.get("azimuth_samples", defaults.azimuth_samples)),
             azimuth_jitter_degrees=float(
                 source.get("azimuth_jitter_degrees", defaults.azimuth_jitter_degrees)
+            ),
+            min_azimuth_separation_degrees=float(
+                source.get(
+                    "min_azimuth_separation_degrees",
+                    defaults.min_azimuth_separation_degrees,
+                )
             ),
             look_jitter_degrees=float(
                 source.get("look_jitter_degrees", defaults.look_jitter_degrees)
@@ -295,11 +375,51 @@ def screen_bbox_ratio(u: np.ndarray, v: np.ndarray) -> float:
 def estimated_screen_ratio(
     half_diagonal: float, radius: float, tan_half_x: float
 ) -> float:
-    """Cheap a-priori estimate used to skip targets that can never fill the frame."""
+    """A-priori on-screen size of a sphere at ``radius`` (kept for callers/tests).
+
+    Do **not** use this to filter targets: with ``radius = radius_scale *
+    half_diagonal`` the half-diagonal cancels out and the value saturates at 1.0
+    for every candidate.  :func:`framability_score` is the ranking signal.
+    """
     if radius <= 1e-6 or tan_half_x <= 1e-6:
         return 0.0
     width_fraction = half_diagonal / (radius * tan_half_x)
     return float(max(0.0, min(1.0, width_fraction * width_fraction)))
+
+
+def framability_score(
+    dimensions: Sequence[float],
+    center_z: float,
+    floor_z: float,
+    support_surface: bool,
+    spec: TargetSpec,
+) -> float:
+    """How likely an entity is to make a readable subject.
+
+    Ranking replaced "largest AABB first", which always picked the biggest
+    non-ignored entity - in Bistro that is the street.  Note that
+    ``estimated_screen_ratio`` cannot do this job: with ``radius =
+    radius_scale * half_diagonal`` the half-diagonal cancels out and the estimate
+    is ~1.0 for every candidate, so it filters nothing.
+    """
+    dims = [max(float(value), 1e-9) for value in dimensions]
+    longest = max(dims)
+    shortest = min(dims)
+    # Closeness to a typical prop size, in log space, saturating at 8x off.
+    size_gap = abs(math.log(longest / max(float(spec.sweet_dimension), 1e-9)))
+    size_score = 1.0 - min(size_gap / math.log(8.0), 1.0)
+    # Reward real three-dimensional volume instead of slabs.
+    slab = min(shortest / longest, 1.0)
+    shape_score = min(slab / 0.50, 1.0)
+    # A cup standing on a table beats a rug lying on the floor.
+    above = (
+        (float(center_z) - float(floor_z)) >= float(spec.prefer_above_floor)
+        and (float(center_z) - float(floor_z)) > float(spec.floor_band)
+    )
+    score = 0.55 * size_score + 0.30 * shape_score + 0.15 * (1.0 if above else 0.0)
+    if support_surface:
+        score -= float(spec.support_surface_penalty)
+    return float(score)
 
 
 def radius_for(half_diagonal: float, spec: TargetSpec) -> float:
@@ -396,47 +516,99 @@ def select_targets(
     *,
     seed: int = 0,
     tan_half_x: float = 0.36,
+    floor_z: float | None = None,
+    report: dict[str, Any] | None = None,
 ) -> list[SceneTarget]:
     """Rank the scene's entities and keep the ones worth framing.
 
-    Selection is purely geometric (size, pixel budget, overlap) because the
-    category classifier is not reliable enough to be a whitelist; ``raw_label``
-    is carried along for provenance only.
+    Selection is geometric *on purpose*: the category classifier is not reliable
+    enough to be a whitelist (``street`` has no generic token, so it surfaces as
+    a 0.60-confidence fallback string), so the hard filters are shape and size,
+    and ``raw_label``/``category`` are carried along for provenance only.
+
+    ``report``, when given, is filled with per-candidate verdicts so
+    ``plan_scene_cameras.py`` can explain *why* a scene produced no subject
+    instead of leaving it to guesswork.
     """
     bounds = _node_bounds(scene)
     if not bounds:
+        if report is not None:
+            report.update({"candidates": 0, "selected": [], "rejected": {}})
         return []
+    lows = [entry[0] for entry in bounds.values()]
+    highs = [entry[1] for entry in bounds.values()]
+    scene_min = [min(row[axis] for row in lows) for axis in range(3)]
+    scene_max = [max(row[axis] for row in highs) for axis in range(3)]
+    scene_diagonal = math.dist(scene_min, scene_max)
+    if floor_z is None:
+        floor_z = float(scene_min[2])
+    floor_z = float(floor_z)
+
     ignored = {str(item).lower() for item in spec.ignore_categories}
+    rejected: dict[str, int] = {}
+    rejected_examples: dict[str, str] = {}
     candidates: list[tuple[float, SceneTarget]] = []
+
+    def reject(reason: str, label: str) -> None:
+        rejected[reason] = rejected.get(reason, 0) + 1
+        rejected_examples.setdefault(reason, label)
+
     for entity in scene.get("entities") or []:
+        label = str(entity.get("raw_label", ""))
         category = str(entity.get("category", "")).lower()
         if category in ignored:
+            reject("ignored_category", label)
             continue
         box = entity_box(entity, bounds)
         if box is None:
+            reject("no_bounds", label)
             continue
         minimum, maximum, triangles = box
         if triangles <= 0:
+            reject("no_triangles", label)
             continue
         dimensions = [maximum[axis] - minimum[axis] for axis in range(3)]
         if min(dimensions) <= 0.0:
+            reject("degenerate_box", label)
             continue
         half_diagonal = 0.5 * math.sqrt(sum(value * value for value in dimensions))
         if half_diagonal * 2.0 < float(spec.min_diagonal):
+            reject("too_small", label)
             continue
-        radius = radius_for(half_diagonal, spec)
-        estimate = estimated_screen_ratio(half_diagonal, radius, tan_half_x)
-        if estimate < float(spec.min_target_screen_ratio):
+        longest, shortest = max(dimensions), min(dimensions)
+        # Shape filters.  These, not the category list, are what keep streets,
+        # doormats and building shells out: a street is a 0.1 m thick sheet that
+        # spans the fragment, a doormat is 1 cm thick.
+        if shortest < float(spec.min_thickness):
+            reject("too_thin", label)
+            continue
+        if shortest / longest < float(spec.flat_ratio):
+            reject("too_flat", label)
+            continue
+        if longest > float(spec.max_dimension):
+            reject("too_big", label)
+            continue
+        if scene_diagonal > 0.0 and math.sqrt(
+            sum(value * value for value in dimensions)
+        ) > float(spec.max_scene_diagonal_fraction) * scene_diagonal:
+            reject("spans_scene", label)
             continue
         center = [
             (float(minimum[axis]) + float(maximum[axis])) * 0.5 for axis in range(3)
         ]
+        score = framability_score(
+            dimensions,
+            float(center[2]),
+            floor_z,
+            bool(entity.get("support_surface")),
+            spec,
+        )
         candidates.append(
             (
-                half_diagonal,
+                score,
                 SceneTarget(
                     entity_id=str(entity.get("entity_id", "")),
-                    label=str(entity.get("raw_label", "")),
+                    label=label,
                     category=category,
                     node_ids=tuple(str(value) for value in entity.get("node_ids") or []),
                     minimum=tuple(float(value) for value in minimum),
@@ -448,8 +620,8 @@ def select_targets(
                 ),
             )
         )
-    # Largest first, deterministic tie-break so the same scene always yields the
-    # same target list regardless of entity ordering in scene.json.
+    # Best framability first; deterministic tie-break on the entity id so the
+    # same scene always yields the same target list regardless of entity order.
     candidates.sort(key=lambda row: (-row[0], row[1].entity_id))
     chosen: list[SceneTarget] = []
     for _size, target in candidates:
@@ -467,6 +639,24 @@ def select_targets(
     for target in chosen:
         target.samples = surface_samples(
             target.minimum, target.maximum, spec.surface_samples, rng
+        )
+    if report is not None:
+        report.update(
+            {
+                "candidates": len(candidates),
+                "scene_floor_z": float(floor_z),
+                "selected": [
+                    {
+                        "entity_id": target.entity_id,
+                        "label": target.label,
+                        "category": target.category,
+                        "dimensions": [round(value, 3) for value in target.dimensions],
+                    }
+                    for target in chosen
+                ],
+                "rejected": dict(sorted(rejected.items())),
+                "rejected_examples": dict(sorted(rejected_examples.items())),
+            }
         )
     return chosen
 
@@ -501,6 +691,7 @@ __all__ = [
     "TargetSpec",
     "entity_box",
     "estimated_screen_ratio",
+    "framability_score",
     "look_angles",
     "occluder_exclusions",
     "project_points",
