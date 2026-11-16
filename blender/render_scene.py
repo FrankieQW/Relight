@@ -224,7 +224,7 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
             "in_scene_lights": [fixture_component] if fixture_component else [],
             "camera": {
                 "name": camera.name,
-                "strategy": "scene_free_space_v2",
+                "strategy": str(job["camera"].get("strategy", "scene_free_space_v2")),
                 "location": [float(value) for value in camera.location],
                 "rotation_euler": [float(value) for value in camera.rotation_euler],
                 "focal_length": float(camera.data.lens),
@@ -256,6 +256,19 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
             "lineage": job["lineage"],
             "license": job.get("license", {}),
         }
+        target_block = (job.get("lineage", {}) or {}).get("target")
+        if target_block:
+            # Record what the sample is about, plus what geometry actually saw
+            # it after the exact-triangle re-check.
+            metadata["target"] = dict(target_block)
+            metadata["target"]["geometry_visible_ratio"] = gate.get(
+                "target_visible_ratio"
+            )
+            metadata["canonical"]["target_entity_id"] = target_block.get("entity_id")
+            metadata["canonical"]["target_radius"] = target_block.get("radius")
+            metadata["canonical"]["target_node_ids"] = list(
+                target_block.get("node_ids") or []
+            )
         if passes_metadata is not None:
             if not helpers.cleanup_pass_temporaries(passes_ctx["dir"]):
                 raise RuntimeError("pass temporary files remain after render")
@@ -310,11 +323,27 @@ def _validate_camera_pose(job: dict[str, Any], runtime: dict[str, Any]) -> dict[
     near_clearance = float(config.get("near_clearance", 0.30))
     grid = max(3, int(config.get("ray_grid", 16)))
     max_distance = float(config.get("max_depth", 45.0))
-    minimum_hit_fraction = float(config.get("min_hit_fraction", 0.90))
-    max_near_fraction = float(config.get("max_near_fraction", 0.25))
     near_window = float(config.get("near_window", 1.00))
     max_single_object = float(config.get("max_single_object_fraction", 0.90))
     min_depth_spread = float(config.get("min_depth_spread_ratio", 1.35))
+    # Entity-conditioned jobs name a target; the subject is then allowed to fill
+    # the frame, so the background gates are relaxed and the subject itself is
+    # re-checked against real triangles.
+    target_names, target_objects = _target_objects(job)
+    targeted = bool(target_names)
+    minimum_hit_fraction = float(
+        config.get("min_hit_fraction_targeted", 0.60)
+        if targeted
+        else config.get("min_hit_fraction", 0.90)
+    )
+    contact_tolerance = float(config.get("contact_tolerance", 0.02))
+    target_samples = max(1, int(config.get("target_ray_samples", 256)))
+    min_target_visible = float(config.get("min_target_visible_ratio", 0.40))
+    near_fraction_limit = float(
+        config.get("max_near_fraction_targeted", 0.85)
+        if targeted
+        else config.get("max_near_fraction", 0.25)
+    )
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
     clearance = _camera_clearance(location, camera_radius * 4.0)
@@ -326,6 +355,7 @@ def _validate_camera_pose(job: dict[str, Any], runtime: dict[str, Any]) -> dict[
     tan_x = math.tan(angle_x * 0.5) * 1.02
     tan_y = math.tan(angle_y * 0.5) * 1.02
     depths: list[float] = []
+    background_depths: list[float] = []
     hits_by_object: dict[str, int] = {}
     misses = 0
     for row in range(grid):
@@ -341,7 +371,9 @@ def _validate_camera_pose(job: dict[str, Any], runtime: dict[str, Any]) -> dict[
                 continue
             depth = (hit_location - location).length
             depths.append(depth)
-            hits_by_object[obj.name] = hits_by_object.get(obj.name, 0) + 1
+            if obj.name not in target_names:
+                background_depths.append(depth)
+                hits_by_object[obj.name] = hits_by_object.get(obj.name, 0) + 1
 
     total = grid * grid
     hit_fraction = len(depths) / total
@@ -349,32 +381,38 @@ def _validate_camera_pose(job: dict[str, Any], runtime: dict[str, Any]) -> dict[
         raise ValueError(
             f"scene camera rejected: no_geometry_in_view (hit_fraction={hit_fraction:.3f} < {minimum_hit_fraction})"
         )
-    minimum = min(depths)
+    # The subject may legitimately be the closest surface; only the background
+    # has to respect the near plane, dominance and depth-spread gates.
+    gate_depths = background_depths or depths
+    minimum = min(gate_depths)
     if minimum < near_clearance:
         raise ValueError(
             f"scene camera rejected: near_geometry_in_view (min_depth={minimum:.3f} < {near_clearance})"
         )
-    near_fraction = sum(1 for depth in depths if depth < near_window) / len(depths)
-    if near_fraction > max_near_fraction:
+    near_fraction = sum(1 for depth in gate_depths if depth < near_window) / len(gate_depths)
+    if near_fraction > near_fraction_limit:
         raise ValueError(
-            f"scene camera rejected: closeup_single_surface (near_fraction={near_fraction:.3f} > {max_near_fraction})"
+            f"scene camera rejected: closeup_single_surface (near_fraction={near_fraction:.3f} > {near_fraction_limit})"
         )
-    dominant_name, dominant_hits = max(hits_by_object.items(), key=lambda item: item[1])
-    dominance = dominant_hits / len(depths)
+    if hits_by_object:
+        dominant_name, dominant_hits = max(hits_by_object.items(), key=lambda item: item[1])
+        dominance = dominant_hits / max(len(depths), 1)
+    else:
+        dominant_name, dominance = "", 0.0
     if dominance > max_single_object:
         raise ValueError(
             "scene camera rejected: single_object_dominates "
             f"({dominant_name} covers {dominance:.3f} > {max_single_object})"
         )
-    ordered = sorted(depths)
+    ordered = sorted(gate_depths)
     low = ordered[max(0, int(len(ordered) * 0.10) - 1)]
     high = ordered[min(len(ordered) - 1, int(len(ordered) * 0.90))]
     spread = high / max(low, 1e-6)
-    if spread < min_depth_spread:
+    if spread < min_depth_spread and not (targeted and len(background_depths) < 4):
         raise ValueError(
             f"scene camera rejected: depth_spread_too_small (spread={spread:.3f} < {min_depth_spread})"
         )
-    return {
+    report = {
         "camera_clearance": clearance,
         "hit_fraction": hit_fraction,
         "hit_rays": len(depths),
@@ -388,6 +426,95 @@ def _validate_camera_pose(job: dict[str, Any], runtime: dict[str, Any]) -> dict[
         "depth_p90": high,
         "depth_spread_ratio": spread,
     }
+    if targeted:
+        report["target_visible_ratio"] = _target_visible_ratio(
+            job,
+            location,
+            target_names,
+            target_objects,
+            depsgraph,
+            max_distance=max_distance,
+            samples=target_samples,
+            contact_tolerance=contact_tolerance,
+        )
+        ratio = float(report["target_visible_ratio"])
+        if ratio < min_target_visible:
+            raise ValueError(
+                "scene camera rejected: target_not_visible "
+                f"(target_visible_ratio={ratio:.3f} < {min_target_visible})"
+            )
+    return report
+
+
+def _target_objects(job: dict[str, Any]) -> tuple[set[str], list[Any]]:
+    """Blender objects that make up the job's named target entity."""
+    node_ids = {
+        str(value)
+        for value in (job.get("canonical", {}) or {}).get("target_node_ids") or []
+    }
+    if not node_ids:
+        return set(), []
+    objects = [
+        obj
+        for obj in bpy.data.objects
+        if obj.type == "MESH"
+        and not obj.hide_render
+        and str(obj.get("lc_scene_object_id") or "") in node_ids
+    ]
+    return {obj.name for obj in objects}, objects
+
+
+def _target_visible_ratio(
+    job: dict[str, Any],
+    location: Vector,
+    target_names: set[str],
+    target_objects: list[Any],
+    depsgraph: Any,
+    *,
+    max_distance: float,
+    samples: int,
+    contact_tolerance: float,
+) -> float:
+    """Share of the target's own vertices that are actually visible.
+
+    This is the authoritative occlusion test: the planner only knows AABBs, so a
+    cup sitting on a table can look hidden there even though it is not.
+    """
+    points: list[Vector] = []
+    if target_objects:
+        per_object = max(1, samples // len(target_objects))
+        for obj in target_objects:
+            vertices = list(obj.data.vertices)
+            if not vertices:
+                continue
+            stride = max(1, len(vertices) // per_object)
+            matrix = obj.matrix_world
+            for index in range(0, len(vertices), stride):
+                points.append(matrix @ vertices[index].co)
+                if len(points) >= samples:
+                    break
+            if len(points) >= samples:
+                break
+    if not points:
+        return 0.0
+    visible = 0
+    sampled = 0
+    for point in points:
+        offset = point - location
+        distance = offset.length
+        if distance <= 1e-6:
+            continue
+        sampled += 1
+        hit, hit_location, _normal, _face, hit_object, _matrix = bpy.context.scene.ray_cast(
+            depsgraph, location, offset / distance, distance=max_distance
+        )
+        if not hit or hit_object is None:
+            continue
+        if hit_object.name in target_names:
+            visible += 1
+        elif (hit_location - point).length <= contact_tolerance:
+            visible += 1
+    return visible / max(sampled, 1)
 
 
 def _camera_clearance(location: Vector, radius: float) -> float:

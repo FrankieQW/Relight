@@ -91,6 +91,11 @@ class SceneCamera(StrictModel):
     depth_spread_ratio: float
     single_node_fraction: float
     score: float
+    # Entity-conditioned jobs only; absent for ``scene_free_space_v1`` poses.
+    target_entity_id: str | None = None
+    target_label: str | None = None
+    target_visible_ratio: float | None = None
+    target_screen_ratio: float | None = None
 
 
 class SceneCameraJob(StrictModel):

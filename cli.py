@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> None:
 def _plan_scene_cameras(config, args) -> dict[str, Any]:
     from .io_utils import dump_json_atomic, dump_jsonl_atomic
     from .scene_cameras import CameraSpec, build_scene_camera_jobs, load_scene_document
+    from .scene_targets import TargetSpec
 
     m4 = config.section("m4")
     camera = m4.get("camera", {}) or {}
@@ -94,7 +95,21 @@ def _plan_scene_cameras(config, args) -> dict[str, Any]:
         min_depth_spread_ratio=float(camera.get("min_depth_spread_ratio", 1.35)),
         attempts_per_camera=int(camera.get("attempts_per_camera", 32)),
         min_camera_spacing=float(camera.get("min_camera_spacing", 1.50)),
+        strategy=str(camera.get("strategy", "scene_free_space_v1")),
+        mix_with_free_space=float(camera.get("mix_with_free_space", 0.30)),
+        min_hit_fraction_targeted=float(
+            camera.get("min_hit_fraction_targeted", 0.60)
+        ),
+        max_near_fraction_targeted=float(
+            camera.get("max_near_fraction_targeted", 0.85)
+        ),
+        target=TargetSpec.from_mapping(camera.get("target")),
     )
+    if spec.strategy not in {"scene_free_space_v1", "entity_conditioned_v1"}:
+        raise ValueError(
+            f"m4.camera.strategy is not implemented: {spec.strategy!r} "
+            "(expected scene_free_space_v1 or entity_conditioned_v1)"
+        )
     cameras_per_scene = int(
         args.cameras_per_scene
         if args.cameras_per_scene is not None

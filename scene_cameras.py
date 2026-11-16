@@ -40,6 +40,17 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
+from .scene_targets import (
+    SceneTarget,
+    TargetSpec,
+    look_angles,
+    occluder_exclusions,
+    project_points,
+    radius_for,
+    screen_bbox_ratio,
+    select_targets,
+)
+
 
 SCENE_CAMERA_CONTRACT_VERSION = "1"
 CANONICAL_AXES = "x=right,y=camera-forward,z=up"  # must match coordinates.CANONICAL_AXES
@@ -79,6 +90,17 @@ class CameraSpec:
     max_single_node_fraction: float = 0.90
     min_depth_spread_ratio: float = 1.35
 
+    # Strategy.  ``scene_free_space_v1`` is the original planner and stays
+    # bit-for-bit reproducible; ``entity_conditioned_v1`` frames a named target
+    # entity and mixes in ``mix_with_free_space`` room-level wide shots.
+    strategy: str = "scene_free_space_v1"
+    mix_with_free_space: float = 0.30
+    min_hit_fraction_targeted: float = 0.60
+    # ``near_window``/``max_near_fraction`` are room-scale: at a 0.6 m orbit the
+    # table and floor are *always* inside 1 m, so close-ups need their own cap.
+    max_near_fraction_targeted: float = 0.85
+    target: TargetSpec = TargetSpec()
+
     # Search budget
     attempts_per_camera: int = 32
     min_camera_spacing: float = 0.0
@@ -112,9 +134,19 @@ class CameraSpec:
             "min_depth_spread_ratio": float(self.min_depth_spread_ratio),
             "attempts_per_camera": int(self.attempts_per_camera),
             "min_camera_spacing": float(self.min_camera_spacing),
+            "strategy": self.strategy,
+            "mix_with_free_space": float(self.mix_with_free_space),
+            "min_hit_fraction_targeted": float(self.min_hit_fraction_targeted),
+            "max_near_fraction_targeted": float(self.max_near_fraction_targeted),
+            "target": self.target.as_dict(),
             "angle_x": angle_x,
             "angle_y": angle_y,
         }
+
+    def tan_half_x(self) -> float:
+        """``tan(angle_x / 2)``; used to estimate a target's on-screen size."""
+        angle_x, _angle_y = self.angles()
+        return math.tan(angle_x * 0.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -412,6 +444,207 @@ def evaluate_pose(
     return {"ok": True, "reason": None, "metrics": metrics}
 
 
+def target_screen_metrics(
+    location: Sequence[float],
+    forward: Sequence[float],
+    right: Sequence[float],
+    up: Sequence[float],
+    spec: CameraSpec,
+    target: SceneTarget,
+    *,
+    margin: float | None = None,
+) -> dict[str, Any]:
+    """On-screen size and centring of one target from a given pose."""
+    angle_x, angle_y = spec.angles()
+    limit = float(spec.target.in_frame_margin if margin is None else margin)
+    u, v, depth = project_points(
+        location, forward, right, up, angle_x, angle_y, target.samples
+    )
+    front = depth > 1e-6
+    if not bool(front.any()):
+        return {"screen_ratio": 0.0, "in_frame": False, "front_samples": 0}
+    center_u, center_v, center_depth = project_points(
+        location, forward, right, up, angle_x, angle_y, [target.center]
+    )
+    in_frame = bool(
+        float(center_depth[0]) > 1e-6
+        and abs(float(center_u[0])) <= limit
+        and abs(float(center_v[0])) <= limit
+    )
+    return {
+        "screen_ratio": screen_bbox_ratio(u[front], v[front]),
+        "in_frame": in_frame,
+        "front_samples": int(front.sum()),
+    }
+
+
+def evaluate_target_pose(
+    free_space: FreeSpace,
+    target: SceneTarget,
+    location: Sequence[float],
+    yaw_degrees: float,
+    pitch_degrees: float,
+    spec: CameraSpec,
+    *,
+    non_occluders: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Evaluate a pose that is supposed to show ``target``.
+
+    The documented rejection reasons are stable strings.  Compared with
+    :func:`evaluate_pose` the emphasis flips: the target is *allowed* to dominate
+    the frame, and the hard statistics (near plane, dominance, depth spread) are
+    computed over non-target geometry only.  What must hold instead is that the
+    target is genuinely visible and reasonably sized.
+    """
+    point = [float(value) for value in location]
+    forward, right, up = camera_basis(yaw_degrees, pitch_degrees)
+    clearance = float(free_space.clearance([point])[0])
+    metrics: dict[str, Any] = {
+        "location": point,
+        "yaw_degrees": float(yaw_degrees),
+        "pitch_degrees": float(pitch_degrees),
+        "forward": forward,
+        "right": right,
+        "up": up,
+        "camera_clearance": clearance,
+        "target_entity_id": target.entity_id,
+        "target_label": target.label,
+        "target_category": target.category,
+        "target_node_ids": list(target.node_ids),
+        "target_center": [float(value) for value in target.center],
+        "target_radius": float(target.half_diagonal),
+    }
+    if clearance < spec.camera_radius:
+        return {"ok": False, "reason": "camera_inside_geometry", "metrics": metrics}
+
+    node_index = {node_id: index for index, node_id in enumerate(free_space.node_ids)}
+    target_indices = [
+        node_index[node_id] for node_id in target.node_ids if node_id in node_index
+    ]
+    non_occluder_indices = [
+        node_index[node_id] for node_id in non_occluders if node_id in node_index
+    ]
+    mask = free_space.nearby_mask(point, spec.max_depth)
+    if not bool(mask.any()):
+        return {"ok": False, "reason": "empty_view_volume", "metrics": metrics}
+    if not target_indices:
+        return {"ok": False, "reason": "target_not_in_scene", "metrics": metrics}
+
+    # -- target visibility --------------------------------------------------
+    samples = np.asarray(target.samples, dtype=np.float64).reshape(-1, 3)
+    if not len(samples):
+        return {"ok": False, "reason": "target_has_no_samples", "metrics": metrics}
+    relative = samples - np.asarray(point, dtype=np.float64)[None, :]
+    distances = np.linalg.norm(relative, axis=1)
+    usable = distances > 1e-6
+    if not bool(usable.any()):
+        return {"ok": False, "reason": "target_has_no_samples", "metrics": metrics}
+    directions = relative[usable] / distances[usable][:, None]
+    sample_depths, sample_boxes = free_space.raycast(
+        point, directions, max_distance=spec.max_depth, mask=mask
+    )
+    own = np.isin(sample_boxes, np.asarray(target_indices, dtype=np.int64))
+    hits = sample_depths >= 0.0
+    # A sample whose ray is stopped by a non-occluding thin/transparent node, or
+    # by a surface it physically rests on, still counts as visible: the cup on
+    # the table is not "hidden by the table", it is touching it.
+    tolerated = hits & (np.abs(distances[usable] - sample_depths) <= float(spec.target.contact_tolerance))
+    transparent = hits & np.isin(
+        sample_boxes, np.asarray(non_occluder_indices, dtype=np.int64)
+    )
+    visible = own | tolerated | transparent
+    visible_ratio = float(visible.sum() / max(len(visible), 1))
+    metrics["target_visible_ratio"] = visible_ratio
+    metrics["target_sample_count"] = int(len(visible))
+
+    occluders = sample_boxes[hits & ~own & ~tolerated & ~transparent]
+    metrics["occluder_node_ids"] = sorted(
+        {
+            free_space.node_ids[int(index)]
+            for index in np.unique(occluders)
+            if int(index) >= 0
+        }
+    )
+    if visible_ratio < float(spec.target.min_target_visible_ratio):
+        return {"ok": False, "reason": "target_occluded", "metrics": metrics}
+
+    # -- framing ------------------------------------------------------------
+    framing = target_screen_metrics(point, forward, right, up, spec, target)
+    metrics["target_screen_ratio"] = float(framing["screen_ratio"])
+    metrics["target_in_frame"] = bool(framing["in_frame"])
+    if not framing["in_frame"]:
+        return {"ok": False, "reason": "target_out_of_frame", "metrics": metrics}
+    if framing["screen_ratio"] < float(spec.target.min_target_screen_ratio):
+        return {"ok": False, "reason": "target_too_small", "metrics": metrics}
+    if framing["screen_ratio"] > float(spec.target.max_target_screen_ratio):
+        return {"ok": False, "reason": "target_too_large", "metrics": metrics}
+
+    # -- legacy gates, computed over non-target geometry --------------------
+    directions = view_directions(forward, right, up, spec)
+    depth, box_index = free_space.raycast(
+        point, directions, max_distance=spec.max_depth, mask=mask
+    )
+    hits = depth >= 0.0
+    hit_count = int(hits.sum())
+    total = int(len(depth))
+    metrics["ray_count"] = total
+    metrics["hit_fraction"] = float(hit_count / max(total, 1))
+    if metrics["hit_fraction"] < float(spec.min_hit_fraction_targeted):
+        return {"ok": False, "reason": "no_geometry_in_view", "metrics": metrics}
+
+    target_hit = hits & np.isin(box_index, np.asarray(target_indices, dtype=np.int64))
+    others = hits & ~target_hit
+    other_depths = depth[others]
+    if other_depths.size >= 4:
+        minimum = float(other_depths.min())
+        metrics["minimum_hit_depth"] = minimum
+        if minimum < spec.near_clearance:
+            return {"ok": False, "reason": "near_geometry_in_view", "metrics": metrics}
+        near_fraction = float(np.mean(other_depths < spec.near_window))
+        counts = np.bincount(box_index[others], minlength=len(free_space.mins))
+        dominant = int(np.argmax(counts))
+        dominance = float(counts[dominant] / max(int(others.sum()), 1))
+        low = float(np.percentile(other_depths, 10.0))
+        high = float(np.percentile(other_depths, 90.0))
+        spread = high / max(low, 1e-6)
+        metrics["dominant_node_id"] = free_space.node_ids[dominant]
+    else:
+        # The target legitimately fills the frame; nothing else is visible.
+        minimum = float(depth[hits].min()) if hit_count else float(spec.max_depth)
+        metrics["minimum_hit_depth"] = minimum
+        near_fraction = 0.0
+        dominance = 0.0
+        low = high = minimum
+        spread = float("inf")
+        metrics["dominant_node_id"] = target.node_ids[0] if target.node_ids else None
+    metrics["near_fraction"] = near_fraction
+    metrics["single_node_fraction"] = dominance
+    metrics["depth_p10"] = low
+    metrics["depth_p90"] = high
+    metrics["depth_spread_ratio"] = spread
+    if near_fraction > spec.max_near_fraction_targeted:
+        return {"ok": False, "reason": "closeup_single_surface", "metrics": metrics}
+    if dominance > spec.max_single_node_fraction:
+        return {"ok": False, "reason": "single_node_dominates", "metrics": metrics}
+    if math.isfinite(spread) and spread < spec.min_depth_spread_ratio:
+        return {"ok": False, "reason": "depth_spread_too_small", "metrics": metrics}
+
+    # -- anchor: the target centre, so canonical.origin is a real place -----
+    anchor_depth = float(
+        math.dist(point, [float(value) for value in target.center])
+    )
+    metrics["anchor_depth"] = anchor_depth
+    metrics["anchor"] = [float(value) for value in target.center]
+    metrics["score"] = (
+        0.45 * visible_ratio
+        + 0.25 * min(framing["screen_ratio"] / 0.15, 1.0)
+        - 0.50 * near_fraction
+        - 0.30 * dominance
+        + 0.10 * metrics["hit_fraction"]
+    )
+    return {"ok": True, "reason": None, "metrics": metrics}
+
+
 # --------------------------------------------------------------------------- #
 # Sampling
 # --------------------------------------------------------------------------- #
@@ -441,11 +674,16 @@ def sample_camera_poses(
     seed: int,
     count: int,
     existing: Iterable[Sequence[float]] = (),
+    targets: Sequence[SceneTarget] = (),
+    min_target_screen_ratio: float | None = None,
 ) -> dict[str, Any]:
     """Search ``count`` collision-free camera poses inside one scene.
 
     Returns ``{"accepted": [...], "rejects": [...], "stats": {...}}``.  Only the
     best-scoring accepted poses are returned when more than ``count`` qualify.
+    When ``targets`` and ``min_target_screen_ratio`` are supplied, a pose is only
+    kept if at least one target reaches that on-screen size - so even the
+    room-level wide shots cannot degenerate into a bare wall corner.
     """
     if count < 1:
         raise ValueError("count must be positive")
@@ -505,6 +743,24 @@ def sample_camera_poses(
                     {"reason": f"final_gate:{verdict['reason']}", "location": location}
                 )
                 continue
+        if targets and min_target_screen_ratio is not None:
+            metrics = verdict["metrics"]
+            best = max(
+                target_screen_metrics(
+                    location,
+                    metrics["forward"],
+                    metrics["right"],
+                    metrics["up"],
+                    spec,
+                    target,
+                )["screen_ratio"]
+                for target in targets
+            )
+            if best < float(min_target_screen_ratio):
+                result_rejects.append(
+                    {"reason": "no_target_in_view", "location": location}
+                )
+                continue
         accepted.append(verdict["metrics"])
         taken.append(location)
     accepted.sort(key=lambda row: (-float(row["score"]), row["location"]))
@@ -520,6 +776,181 @@ def sample_camera_poses(
         "height_policy": "floor_standing" if use_floor_policy else "free",
     }
     return {"accepted": accepted[:count], "rejects": result_rejects, "stats": stats}
+
+
+def _local_radius_cap(
+    free_space: FreeSpace,
+    center: Sequence[float],
+    target_node_ids: Sequence[str],
+    spec: CameraSpec,
+) -> float:
+    """Upper bound on the orbit radius so the shell does not sink into geometry.
+
+    An object pushed against a wall or standing on a table has almost no free
+    space on some sides; clamping the radius keeps the sampler from spending its
+    whole budget on candidates that are already inside a mesh.
+    """
+    node_index = {node_id: index for index, node_id in enumerate(free_space.node_ids)}
+    own = [node_index[value] for value in target_node_ids if value in node_index]
+    others = np.ones(len(free_space.mins), dtype=bool)
+    if own:
+        others[own] = False
+    if not bool(others.any()):
+        return float(spec.target.max_radius)
+    point = np.asarray(center, dtype=np.float64)[None, :]
+    clamped = np.clip(point, free_space.mins[others], free_space.maxs[others])
+    distance = float(np.sqrt(((point - clamped) ** 2).sum(axis=1)).min())
+    upper = max(float(spec.target.min_radius), 0.8 * distance)
+    return float(min(float(spec.target.max_radius), upper))
+
+
+def sample_targeted_poses(
+    scene: dict[str, Any],
+    spec: CameraSpec,
+    *,
+    seed: int,
+    count: int,
+    existing: Iterable[Sequence[float]] = (),
+) -> dict[str, Any]:
+    """Orbit ``count`` cameras around the scene's best framable targets.
+
+    Structure mirrors :func:`sample_camera_poses` so callers can treat both the
+    same.  The extra ``targets`` key carries the chosen :class:`SceneTarget`
+    objects for reuse (e.g. the room-level wide shots must still contain one).
+    """
+    if count < 1:
+        raise ValueError("count must be positive")
+    stats_empty = {
+        "attempts": 0,
+        "accepted": 0,
+        "kept": 0,
+        "acceptance_rate": 0.0,
+        "rejects": 0,
+        "reject_reasons": {},
+        "nodes": len(scene.get("nodes") or []),
+        "floor_nodes": 0,
+        "height_policy": "entity_orbit",
+        "targets": 0,
+        "target_ids": [],
+    }
+    if not spec.target.enabled:
+        return {
+            "accepted": [],
+            "rejects": [{"reason": "targets_disabled"}],
+            "stats": stats_empty,
+            "targets": [],
+        }
+    try:
+        free_space = FreeSpace.from_scene(scene)
+    except ValueError as error:
+        return {
+            "accepted": [],
+            "rejects": [{"reason": "unusable_scene_bounds", "detail": str(error)}],
+            "stats": stats_empty,
+            "targets": [],
+        }
+    targets = select_targets(
+        scene, spec.target, seed=seed, tan_half_x=spec.tan_half_x()
+    )
+    if not targets:
+        return {
+            "accepted": [],
+            "rejects": [{"reason": "no_valid_target"}],
+            "stats": stats_empty,
+            "targets": [],
+        }
+    non_occluders = occluder_exclusions(scene, spec.target)
+    rng = random.Random(_seed_for(seed, str(scene.get("scene_id", "scene")), "target"))
+    accepted: list[dict[str, Any]] = []
+    result_rejects: list[dict[str, Any]] = []
+    taken = [list(point) for point in existing]
+    radius_low, radius_high = spec.target.radius_jitter
+    radius_low = max(float(radius_low), 1e-3)
+    radius_high = max(float(radius_high), radius_low)
+    azimuth_count = max(1, int(spec.target.azimuth_samples))
+    budget = int(count) * max(1, int(spec.target.attempts_per_target))
+    attempts = 0
+    cursor = 0
+    while len(accepted) < count and attempts < budget:
+        target = targets[cursor % len(targets)]
+        cursor += 1
+        attempts += 1
+        azimuth = (
+            360.0 * float(attempts % azimuth_count) / float(azimuth_count)
+            + rng.uniform(
+                -float(spec.target.azimuth_jitter_degrees),
+                float(spec.target.azimuth_jitter_degrees),
+            )
+        )
+        pitch = rng.uniform(*spec.target.pitch_degrees)
+        yawrad = math.radians(azimuth)
+        pitchrad = math.radians(pitch)
+        direction = (
+            math.cos(pitchrad) * math.cos(yawrad),
+            math.cos(pitchrad) * math.sin(yawrad),
+            math.sin(pitchrad),
+        )
+        cap = _local_radius_cap(free_space, target.center, target.node_ids, spec)
+        base = radius_for(target.half_diagonal, spec.target)
+        scale = math.exp(
+            rng.uniform(math.log(radius_low), math.log(radius_high))
+        )
+        radius = max(
+            float(spec.target.min_radius),
+            min(cap, base * scale),
+        )
+        location = [
+            float(target.center[axis]) + direction[axis] * radius for axis in range(3)
+        ]
+        if spec.min_camera_spacing > 0.0 and taken:
+            nearest = min(math.dist(location, other) for other in taken)
+            if nearest < spec.min_camera_spacing:
+                result_rejects.append(
+                    {"reason": "camera_too_close_to_other_camera", "location": location}
+                )
+                continue
+        to_center = [-(location[axis] - float(target.center[axis])) for axis in range(3)]
+        yaw, pitch_degrees = look_angles(to_center)
+        if spec.target.look_jitter_degrees > 0.0:
+            jitter = float(spec.target.look_jitter_degrees)
+            yaw += rng.uniform(-jitter, jitter)
+            pitch_degrees += rng.uniform(-jitter, jitter)
+        verdict = evaluate_target_pose(
+            free_space,
+            target,
+            location,
+            yaw,
+            pitch_degrees,
+            spec,
+            non_occluders=non_occluders,
+        )
+        if not verdict["ok"]:
+            result_rejects.append(
+                {"reason": verdict["reason"], "location": location}
+            )
+            continue
+        accepted.append(verdict["metrics"])
+        taken.append(location)
+    accepted.sort(key=lambda row: (-float(row["score"]), row["location"]))
+    stats = {
+        "attempts": attempts,
+        "accepted": len(accepted),
+        "kept": min(len(accepted), count),
+        "acceptance_rate": (len(accepted) / attempts) if attempts else 0.0,
+        "rejects": len(result_rejects),
+        "reject_reasons": _count_reasons(result_rejects),
+        "nodes": len(free_space.node_ids),
+        "floor_nodes": 0,
+        "height_policy": "entity_orbit",
+        "targets": len(targets),
+        "target_ids": [target.entity_id for target in targets],
+    }
+    return {
+        "accepted": accepted[:count],
+        "rejects": result_rejects,
+        "stats": stats,
+        "targets": targets,
+    }
 
 
 def _count_reasons(rows: Iterable[dict[str, Any]]) -> dict[str, int]:
@@ -588,7 +1019,7 @@ def build_camera_job(
         "base_scene_blend": base_scene_blend,
         "base_scene_digest": base_scene_digest,
         "camera": {
-            "strategy": "scene_free_space_v1",
+            "strategy": str(spec.strategy),
             "location": location,
             "target": target,
             "rotation_euler": blender_rotation_euler(right, up, forward),
@@ -644,6 +1075,35 @@ def build_camera_job(
             "scene_camera_digest": digest,
         },
     }
+    target_entity_id = metrics.get("target_entity_id")
+    if target_entity_id:
+        # Entity-conditioned job: record what the sample is supposed to show.
+        # ``canonical.origin`` is already the target centre and ``asset_size``
+        # keeps its original meaning (camera-to-anchor distance), so the
+        # renderer's light rig scaling stays correct without any change.
+        label = str(metrics.get("target_label") or "")
+        node_ids = [str(value) for value in metrics.get("target_node_ids") or []]
+        job["camera"]["target_entity_id"] = str(target_entity_id)
+        job["camera"]["target_label"] = label
+        job["camera"]["target_visible_ratio"] = float(metrics["target_visible_ratio"])
+        job["camera"]["target_screen_ratio"] = float(metrics["target_screen_ratio"])
+        job["canonical"]["target_entity_id"] = str(target_entity_id)
+        job["canonical"]["target_label"] = label
+        job["canonical"]["target_radius"] = float(metrics["target_radius"])
+        job["canonical"]["target_node_ids"] = node_ids
+        job["free_space_report"]["occluder_node_ids"] = [
+            str(value) for value in metrics.get("occluder_node_ids") or []
+        ]
+        job["lineage"]["target"] = {
+            "entity_id": str(target_entity_id),
+            "label": label,
+            "category": str(metrics.get("target_category") or ""),
+            "node_ids": node_ids,
+            "center": [float(value) for value in metrics.get("target_center") or target],
+            "radius": float(metrics["target_radius"]),
+            "visible_ratio": float(metrics["target_visible_ratio"]),
+            "screen_ratio": float(metrics["target_screen_ratio"]),
+        }
     return job
 
 
@@ -661,6 +1121,88 @@ def _stable_digest(value: Any) -> str:
         "utf-8"
     )
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def camera_count_split(count: int, mix_with_free_space: float) -> tuple[int, int]:
+    """Split ``count`` cameras into ``(targeted, free_space)`` wide shots."""
+    if count < 1:
+        raise ValueError("count must be positive")
+    mix = min(1.0, max(0.0, float(mix_with_free_space)))
+    if count == 1:
+        return 1, 0
+    free = int(round(count * mix))
+    free = min(free, count - 1)
+    targeted = count - free
+    return targeted, free
+
+
+def _sample_scene_cameras(
+    scene: dict[str, Any],
+    spec: CameraSpec,
+    *,
+    seed: int,
+    count: int,
+) -> dict[str, Any]:
+    """Dispatch on ``spec.strategy`` and merge both halves into one result."""
+    if spec.strategy != "entity_conditioned_v1":
+        return sample_camera_poses(scene, spec, seed=seed, count=count)
+    targeted_count, free_count = camera_count_split(count, spec.mix_with_free_space)
+    targeted = sample_targeted_poses(scene, spec, seed=seed, count=targeted_count)
+    free: dict[str, Any] = {
+        "accepted": [],
+        "rejects": [],
+        "stats": {
+            "attempts": 0,
+            "accepted": 0,
+            "kept": 0,
+            "acceptance_rate": 0.0,
+            "rejects": 0,
+            "reject_reasons": {},
+            "nodes": 0,
+            "floor_nodes": 0,
+            "height_policy": "free_space",
+        },
+    }
+    if free_count > 0 and targeted["targets"]:
+        free = sample_camera_poses(
+            scene,
+            spec,
+            seed=seed,
+            count=free_count,
+            targets=targeted["targets"],
+            min_target_screen_ratio=spec.target.min_target_screen_ratio,
+        )
+    accepted = list(targeted["accepted"]) + list(free["accepted"])
+    accepted.sort(key=lambda row: (-float(row["score"]), row["location"]))
+    reasons = dict(targeted["stats"]["reject_reasons"])
+    for reason, hits in free["stats"]["reject_reasons"].items():
+        reasons[reason] = reasons.get(reason, 0) + int(hits)
+    attempts = targeted["stats"]["attempts"] + free["stats"]["attempts"]
+    rejects = targeted["stats"]["rejects"] + free["stats"]["rejects"]
+    stats = {
+        "attempts": attempts,
+        "accepted": len(accepted),
+        "kept": min(len(accepted), count),
+        "acceptance_rate": (len(accepted) / attempts) if attempts else 0.0,
+        "rejects": rejects,
+        "reject_reasons": dict(sorted(reasons.items())),
+        "nodes": max(targeted["stats"]["nodes"], free["stats"]["nodes"]),
+        "floor_nodes": free["stats"]["floor_nodes"],
+        "height_policy": "entity_conditioned_v1",
+        "strategy": str(spec.strategy),
+        "targeted_requested": targeted_count,
+        "free_space_requested": free_count,
+        "targets": targeted["stats"]["targets"],
+        "target_ids": targeted["stats"]["target_ids"],
+        "targeted_accepted": len(targeted["accepted"]),
+        "free_space_accepted": len(free["accepted"]),
+    }
+    return {
+        "accepted": accepted[:count],
+        "rejects": list(targeted["rejects"]) + list(free["rejects"]),
+        "stats": stats,
+        "targets": targeted["targets"],
+    }
 
 
 def build_scene_camera_jobs(
@@ -735,7 +1277,9 @@ def build_scene_camera_jobs(
             if str(entity.get("category", "")) in fixtures
         )
         try:
-            search = sample_camera_poses(scene, spec, seed=seed, count=cameras_per_scene)
+            search = _sample_scene_cameras(
+                scene, spec, seed=seed, count=cameras_per_scene
+            )
         except ValueError as error:
             rejects.append({"scene_id": scene_id, "reason": "unusable_scene_bounds", "detail": str(error)})
             continue
@@ -801,8 +1345,12 @@ __all__ = [
     "build_scene_camera_jobs",
     "blender_rotation_euler",
     "camera_basis",
+    "camera_count_split",
     "evaluate_pose",
+    "evaluate_target_pose",
     "load_scene_document",
     "sample_camera_poses",
+    "sample_targeted_poses",
+    "target_screen_metrics",
     "view_directions",
 ]

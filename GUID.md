@@ -33,6 +33,7 @@ datacompose/
 ├── schemas.py                  Pydantic 数据协议（场景 + 相机 job）
 ├── scene_semantics.py          类别归一化与别名
 ├── scene_cameras.py            场景内无碰撞相机采样（AABB 宽相 + 视野无穿插判据）
+├── scene_targets.py            目标实体挑选 + 投影/可见性几何（实体条件化取景）
 ├── scene_extract.py            prepare-scenes（调用 blender/entry.py）
 ├── render_scenes.py            render（多 GPU worker 调度 blender/render_scene.py）
 ├── render_recovery.py          渲染 partial 的清理与恢复
@@ -60,7 +61,8 @@ datacompose/
     ├── test_manifest_camera.py
     ├── test_render_recovery.py
     ├── test_launcher.py
-    └── test_scene_cameras.py
+    ├── test_scene_cameras.py
+    └── test_scene_camera_targets.py
 ```
 
 本目录是**独立可复制的 compose 项目**：只依赖自身代码与本目录下的 `configs/`、`transfer.py`，
@@ -255,6 +257,48 @@ Y = y_normalized * Z
 `intrinsics` 是权威值；`resolution` + `angle_x/angle_y` + `shift_*` 是可重算的冗余信息，便于老的
 manifest 或外部工具自行恢复。`focal_length` 与 `sensor_width` 只是 Blender 侧的原始参数。
 
+#### 4.1.1 相机策略与目标实体
+
+`camera.strategy` 决定这些相机是怎么选出来的：
+
+| 值 | 含义 |
+| --- | --- |
+| `scene_free_space_v1` | 原始策略：在场景自由空间里随机取位置+朝向。默认值，旧数据集可用它逐字节复现。 |
+| `entity_conditioned_v1` | 以命名实体为目标绕球壳取景，并混入 `mix_with_free_space` 比例的远景。 |
+
+`entity_conditioned_v1` 的 job 会额外写：
+
+```json
+"camera": {
+  "strategy": "entity_conditioned_v1",
+  "target_entity_id": "scene_a:entity:0f3c...",
+  "target_label": "CoffeeCup_01",
+  "target_visible_ratio": 0.83,
+  "target_screen_ratio": 0.14
+},
+"canonical": {
+  "origin": [12.4, -3.1, 0.82],
+  "asset_size": 0.62,
+  "target_entity_id": "scene_a:entity:0f3c...",
+  "target_label": "CoffeeCup_01",
+  "target_radius": 0.104,
+  "target_node_ids": ["node_00412"]
+},
+"free_space_report": {"occluder_node_ids": ["node_00007"]},
+"lineage": {"target": {"entity_id": "...", "label": "CoffeeCup_01", "visible_ratio": 0.83, "...": "..."}}
+```
+
+要点：
+
+- `canonical.origin == camera.target` 仍然成立，但此时它就是**目标实体的中心**，不再是几何中位深度
+  上的空气点。
+- `canonical.asset_size` **保持原语义**：相机到 anchor 的距离。目标尺寸放在 `canonical.target_radius`，
+  因此渲染侧 `anchor_depth` 与点光/面光的距离缩放不需要任何改动。
+- `target_visible_ratio` 是规划阶段的 AABB 可见性估计；渲染侧用真实三角形复核后会写
+  `metadata.target.geometry_visible_ratio`，两者不一致时以渲染侧为准。
+- 没有 `target_entity_id` 的 job 表示它是自由空间远景（混采），它的构图门槛是"画面里至少有一个
+  目标达到 `min_target_screen_ratio`"，因此不会是纯墙角。
+
 ### 4.2 光源块
 
 ```json
@@ -422,6 +466,29 @@ python -m unittest discover -s datacompose/tests -p 'test_*.py'
 `DATACOMPOSE_CONFIG` 与 `--config` 的优先级、以及 `plan-scene-cameras` 的端到端产出。
 `tests/test_scene_cameras.py` 覆盖场景相机判据（相机在几何体内 / 近裁剪穿插 / 单一平面糊屏 /
 深度跨度、确定性、与 `coordinates` 契约的一致性）。
+`tests/test_scene_camera_targets.py` 覆盖实体条件化取景：纯墙角场景必须产不出相机、目标可见性与
+画面占比门槛、被完全遮挡的目标被拒、接触容差、30% 混采的分配与 job/schema 契约。
+
+### 7.1 相机策略调参
+
+`m4.camera.strategy` 切成 `entity_conditioned_v1` 后，所有阈值都在 `m4.camera.target` 下，改完重跑
+`plan_scene_cameras.py` 即可，不需要改代码。最常动的三个：
+
+| 配置 | 默认 | 作用 |
+| --- | --- | --- |
+| `target.min_target_visible_ratio` | 0.40 | 目标表面有多少比例必须真正看得见。贴桌/贴墙的物体不要调高，调高会只剩悬空物体。 |
+| `target.radius_scale` + `radius_jitter` | 2.6 / `[0.85, 1.50]` | 绕行半径 = `radius_scale × 半对角线`。数值越大越"远景"，越小越"特写"。 |
+| `mix_with_free_space` | 0.30 | 远景占比。设为 0 就全部是目标特写。 |
+
+调参前先用离线基准跑一遍 reject 分布（无需 Blender）：
+
+```bash
+python -m datacompose.tools.bench_scene_cameras --strategy entity_conditioned_v1 --cameras 8
+```
+
+`reject_reasons` 里 `target_too_large` 偏多说明半径偏小，`target_occluded` 偏多说明
+`min_target_visible_ratio` 太高或遮挡体判得太死，`no_geometry_in_view` 偏多说明
+`min_hit_fraction_targeted` 太高。
 
 坐标相关的检查集中在 `datacompose/tests/test_coordinates.py`：
 

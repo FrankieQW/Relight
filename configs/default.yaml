@@ -101,6 +101,80 @@ m4:
     min_depth_spread_ratio: 1.35
     attempts_per_camera: 32
     min_camera_spacing: 1.50
+
+    # Camera strategy.
+    #   scene_free_space_v1     - original planner: random free-space positions.
+    #                             Reproduces old datasets bit for bit.
+    #   entity_conditioned_v1   - orbit a named target entity so a sample always
+    #                             has a subject, and mix in room-level wide shots.
+    strategy: scene_free_space_v1
+    # Share of ``cameras_per_scene`` that stays a free-space wide shot. Wide
+    # shots are additionally required to contain at least one target of
+    # ``target.min_target_screen_ratio``, so a bare wall corner cannot pass.
+    mix_with_free_space: 0.30
+    # Same as min_hit_fraction, but for target-framed poses: the subject is
+    # allowed to occupy the frame, so the background may be mostly open.
+    min_hit_fraction_targeted: 0.60
+    # near_window/max_near_fraction are room-scale; when the camera orbits a
+    # subject at ~0.6 m the table and floor are always within 1 m, so close-ups
+    # get their own cap. Raise it toward 0.95 to allow tighter framing.
+    max_near_fraction_targeted: 0.85
+    # Target selection + orbit sampling + visibility gates.
+    target:
+      enabled: true
+      # Entities smaller than this are not worth framing (metres, AABB diagonal).
+      min_diagonal: 0.15
+      max_targets_per_scene: 4
+      # Candidates whose AABBs overlap more than this are counted once.
+      duplicate_iou: 0.80
+      # Never treat these as subjects; they are the "wall corner" failure mode.
+      ignore_categories:
+        - building
+        - ceiling
+        - floor
+        - ground
+        - road
+        - sidewalk
+        - sky
+        - wall
+      # Orbit radius: r = radius_scale * half_diagonal, clamped, then jittered.
+      # 2.6 with a 50 mm lens puts a cube-like object at roughly 40-60% of frame
+      # width; lower it for tighter product shots, raise it for more context.
+      radius_scale: 2.6
+      min_radius: 0.60
+      max_radius: 6.00
+      radius_jitter: [0.85, 1.50]
+      # Elevation of the camera around the subject (degrees; + is above).
+      pitch_degrees: [-10.0, 45.0]
+      azimuth_samples: 12
+      azimuth_jitter_degrees: 15.0
+      # Extra aim slop away from the exact subject centre (0 keeps the target
+      # exactly on the optical axis, which the manifest contract assumes).
+      look_jitter_degrees: 0.0
+      attempts_per_target: 200
+      # Target gate 1: share of subject surface samples that are actually
+      # visible. 0.40 tolerates a subject that rests on a table or stands in a
+      # corner; raise toward 0.9 only for floating objects.
+      min_target_visible_ratio: 0.40
+      surface_samples: 64
+      # Target gate 2: bounding box of the projected subject, as a share of the
+      # frame. Too small = unreadable, too large = a texture close-up.
+      min_target_screen_ratio: 0.02
+      max_target_screen_ratio: 0.75
+      # Target gate 3: the subject centre must sit inside this share of frame.
+      in_frame_margin: 0.90
+      # A ray stopped this close to the subject sample counts as contact, not
+      # occlusion: that is what a cup standing on a table looks like.
+      contact_tolerance: 0.02
+      # Transparent/thin nodes are not occluders (AABB tests would over-reject).
+      ignore_as_occluder_categories:
+        - curtain
+        - foliage
+        - glass
+        - railing
+        - sky
+        - window
+      thin_occluder_thickness: 0.01
   # Entities treated as scene-native light fixtures when in view.
   fixture_categories: [lamp, lantern, light, chandelier, sconce]
   camera_gate:
@@ -113,6 +187,12 @@ m4:
     near_window: 1.00
     max_single_object_fraction: 0.90
     min_depth_spread_ratio: 1.35
+    # Entity-conditioned jobs: relax the background gates and re-check the
+    # subject against real triangles.
+    min_hit_fraction_targeted: 0.60
+    min_target_visible_ratio: 0.40
+    contact_tolerance: 0.02
+    target_ray_samples: 256
   max_render_jobs: null
 
   render_gpu_ids: [0]

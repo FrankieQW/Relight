@@ -227,6 +227,13 @@ def _camera_gate(config: ProjectConfig, m4: dict[str, Any]) -> dict[str, Any]:
     gate.setdefault("near_window", 1.00)
     gate.setdefault("max_single_object_fraction", 0.90)
     gate.setdefault("min_depth_spread_ratio", 1.35)
+    # Entity-conditioned jobs carry a target; these drive the triangle-level
+    # re-check of that target and relax the background-only gates.
+    gate.setdefault("min_hit_fraction_targeted", 0.60)
+    gate.setdefault("max_near_fraction_targeted", 0.85)
+    gate.setdefault("min_target_visible_ratio", 0.40)
+    gate.setdefault("contact_tolerance", 0.02)
+    gate.setdefault("target_ray_samples", 256)
     return gate
 
 

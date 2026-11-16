@@ -16,7 +16,12 @@ import argparse
 import random
 import time
 
-from datacompose.scene_cameras import CameraSpec, FreeSpace, evaluate_pose, sample_camera_poses
+from datacompose.scene_cameras import (
+    CameraSpec,
+    FreeSpace,
+    _sample_scene_cameras,
+    evaluate_pose,
+)
 
 
 def synthetic_scene(node_count: int = 4000, *, size: float = 200.0, seed: int = 20260810) -> dict:
@@ -34,6 +39,7 @@ def synthetic_scene(node_count: int = 4000, *, size: float = 200.0, seed: int = 
                     "min": [x, y, z],
                     "max": [x + extent[0], y + extent[1], z + extent[2]],
                 },
+                "triangle_count": 12,
             }
         )
     # A grid of floor slabs so the eye-height policy has something to stand on.
@@ -50,17 +56,32 @@ def synthetic_scene(node_count: int = 4000, *, size: float = 200.0, seed: int = 
                         "min": [grid_x, grid_y, 0.0],
                         "max": [grid_x + step, grid_y + step, 0.05],
                     },
+                    "triangle_count": 12,
                 }
             )
             entities.append(
                 {
                     "entity_id": f"scene:entity:{node_id}",
                     "node_ids": [node_id],
+                    "raw_label": node_id,
                     "category": "floor",
                     "node_count": 1,
                 }
             )
             floor_index += 1
+    # A sparse set of framable props so the entity-conditioned strategy has
+    # something to orbit; every other node stays anonymous geometry.
+    for index in range(0, node_count, 40):
+        node_id = f"node_{index:05d}"
+        entities.append(
+            {
+                "entity_id": f"scene:entity:prop_{index:05d}",
+                "node_ids": [node_id],
+                "raw_label": f"Prop_{index:05d}",
+                "category": "prop",
+                "node_count": 1,
+            }
+        )
     return {
         "scene_id": "synthetic_bistro_like",
         "source_digest": "sha256:" + "0" * 64,
@@ -76,16 +97,26 @@ def main() -> None:
     parser.add_argument("--cameras", type=int, default=8)
     parser.add_argument("--attempts", type=int, default=32)
     parser.add_argument("--ray-grid", type=int, default=24)
+    parser.add_argument(
+        "--strategy",
+        default="scene_free_space_v1",
+        choices=["scene_free_space_v1", "entity_conditioned_v1"],
+        help="camera planner to benchmark",
+    )
     args = parser.parse_args()
 
     scene = synthetic_scene(args.nodes)
-    spec = CameraSpec(ray_grid=args.ray_grid, attempts_per_camera=args.attempts)
+    spec = CameraSpec(
+        ray_grid=args.ray_grid,
+        attempts_per_camera=args.attempts,
+        strategy=args.strategy,
+    )
 
     start = time.perf_counter()
     space = FreeSpace.from_scene(scene)
     build_seconds = time.perf_counter() - start
     low, high = space.bbox
-    print(f"nodes={len(space.node_ids)} floors={len(scene['entities'])}")
+    print(f"nodes={len(space.node_ids)} entities={len(scene['entities'])} strategy={spec.strategy}")
     print(f"bbox_min={[round(v, 2) for v in low]} bbox_max={[round(v, 2) for v in high]}")
     print(f"free_space_build={build_seconds * 1000:.1f} ms")
 
@@ -96,7 +127,7 @@ def main() -> None:
     print(f"pose_evaluation={per_pose * 1000:.2f} ms  (ray_grid={args.ray_grid} -> {args.ray_grid ** 2} rays)")
 
     start = time.perf_counter()
-    result = sample_camera_poses(scene, spec, seed=1, count=args.cameras)
+    result = _sample_scene_cameras(scene, spec, seed=1, count=args.cameras)
     search_seconds = time.perf_counter() - start
     stats = result["stats"]
     print(
@@ -111,6 +142,9 @@ def main() -> None:
             f"yaw={row['yaw_degrees']:.1f} pitch={row['pitch_degrees']:.1f}",
             f"score={row['score']:.3f} min_depth={row['minimum_hit_depth']:.2f}",
             f"spread={row['depth_spread_ratio']:.2f}",
+            f"target={row.get('target_label')}",
+            f"visible={row.get('target_visible_ratio', 0.0):.2f}",
+            f"screen={row.get('target_screen_ratio', 0.0):.3f}",
         )
 
 

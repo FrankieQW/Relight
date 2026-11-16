@@ -66,6 +66,22 @@ python prepare_scenes.py --blender-bin /opt/blender-4.5/blender
 不通过就整个 job 失败，而不是产出一张穿模的图。判据阈值在 `m4.camera`（规划）与 `m4.camera_gate`
 （渲染复核）里，两边保持一致。
 
+### 目标条件化取景（`entity_conditioned_v1`）
+
+上面这套判据有个副作用：**两面墙组成的墙角是它的最优解**（没有单一节点占优、深度跨度又大），
+于是会产出"画面里只有墙角、没有物体"的样本。把 `m4.camera.strategy` 切成
+`entity_conditioned_v1` 后，`scene_targets.py` 会先挑出可成景的命名实体（按尺寸、像素预算、
+非建筑类筛，`raw_label` 只做溯源），再在它周围的球壳上取景，并要求：
+
+- `target_visible_ratio`：目标表面样本有多少真正看得见（AABB 射线，带接触容差，
+  所以"杯子放在桌上"不算被遮挡）；
+- `target_screen_ratio`：目标投影包围框占画面的比例，太小看不见、太大是糊屏特写；
+- 目标中心必须落在画面安全区内；
+- 旧的近裁剪/命中率判据仍然生效，但只统计**非目标**几何，目标本身可以占满画面。
+
+同时保留 `mix_with_free_space`（默认 0.30）比例的远景，远景也必须含一个达标目标，因此
+不会再出现纯墙角。所有阈值都在 `m4.camera.target` 下，可只改配置、不改代码。
+
 ## 光照
 
 - 环境光：`m4.render.hdri_root` 指向 `.hdr/.exr` 目录（每个样本确定性抽一张），留空则用常色；
@@ -88,7 +104,9 @@ python prepare_scenes.py --blender-bin /opt/blender-4.5/blender
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-`tests/test_scene_cameras.py` 覆盖相机判据与确定性；`tests/test_launcher.py` 覆盖脚本化运行方式；
+`tests/test_scene_cameras.py` 覆盖相机判据与确定性；`tests/test_scene_camera_targets.py` 覆盖目标条件化
+取景（墙角场景产不出相机、目标可见性/画面占比、遮挡与接触容差、混采分配）；
+`tests/test_launcher.py` 覆盖脚本化运行方式；
 `tests/test_coordinates.py`、`test_manifest_camera.py`、`test_intrinsic_passes.py` 覆盖坐标/分量契约。
 
 ## 数据集清单（可选）
